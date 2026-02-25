@@ -113,21 +113,22 @@ git checkout --orphan new-master <prompt:branch:master> && git commit -m "<promp
 #git remote
 git remote -v
 
-# docker delete all containers
-docker system prune --all --force
-#dockerbash in container
-docker exec -t -i <prompt:container name:node> /bin/bash
-# dockertop
-docker stats
-# dockerstopall containers sudo
-docker stop $(sudo docker ps -a -q)
-# dockerstopall stop all containers sudo
-docker stop $(sudo docker ps -a -q)
-
+#docksystem docker system usage info
+sudo docker system df -v
+# dockprune docker delete all containers
+sudo docker system prune --all --force
+#dockbash in container
+sudo docker exec -t -i <prompt:container name:node> /bin/bash
+# docktop docker stats
+sudo docker stats
+# dockstopall docker containers sudo
+sudo docker stop $(sudo docker ps -a -q)
 # dockerlogs
 sudo docker logs --follow <prompt:container:>
+# dockcont docker list containers
+sudo docker ps -as
 
-# npmglobal packages
+# npmglobal list packages
 npm list -g --depth 0
 # npmoutdated glob packages
 npm outdated -g --depth=0
