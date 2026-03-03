@@ -88,7 +88,7 @@ func linesToCommands(stri []string) []string {
 		} else {
 			appendd = ""
 			if len(lastComment) > 0 {
-				appendd = lastComment + "^"
+				appendd = lastComment + "^^"
 			}
 			r = append(r, appendd+str)
 			lastComment = ""
@@ -144,12 +144,12 @@ func executeCommand(command string) {
 		useShell = "sh"
 		lookPath, _ = exec.LookPath(useShell)
 	}
-	labelsS := strings.Split(command, "^")
+	labelsS := strings.Split(command, "^^")
 
 	if len(labelsS) > 1 {
 		labelTagsSL = strings.Split(labelsS[0], " ")
 		labelsS = RemoveIndex(labelsS, 0)
-		command = strings.Join(labelsS, "^")
+		command = strings.Join(labelsS, "^^")
 	}
 	_, hasSudo := Find(labelTagsSL, "sudo")
 	if isSudoSkippable {
@@ -307,13 +307,13 @@ func searchRender(search string) {
 	for i := 0; i < len(commsMod); i++ {
 		toParse := commsMod[i]
 		//toParse = ""
-		split = strings.Split(toParse, "^")
+		split = strings.Split(toParse, "^^")
 		if len(split) > 1 {
-			toParse = "[white]" + split[0] + "[grey]^" + commColor
+			toParse = "[white]" + split[0] + "[grey]^^" + commColor
 			split = RemoveIndex(split, 0)
-			toParse += strings.Join(split, "^")
+			toParse += strings.Join(split, "^^")
 		} else {
-			toParse = commColor + strings.Join(split, "^")
+			toParse = commColor + strings.Join(split, "^^")
 		}
 
 		list.AddItem(toParse, "", 0, nil)
@@ -343,7 +343,7 @@ func main() {
 				label = strings.Trim(line[1:], " ")
 			}
 		}
-		stri = label + "^" + strings.Join(splitLines, "\n")
+		stri = label + "^^" + strings.Join(splitLines, "\n")
 		comms = append(comms, stri)
 	}
 
@@ -360,8 +360,8 @@ func main() {
 	}
 	list = tview.NewList().SetChangedFunc(func(index int, mainText string, secondaryText string, shortcut rune) {
 		toParse := commsMod[index]
-		if strings.Contains(toParse, "^") {
-			breakIndex := strings.Index(toParse, "^") + 1
+		if strings.Contains(toParse, "^^") {
+			breakIndex := strings.Index(toParse, "^^") + 1
 			toParse = string([]rune(toParse)[breakIndex:])
 		}
 		textView.SetText("\n[yellow]" + toParse)
@@ -394,7 +394,7 @@ func main() {
 			fmt.Printf("%s", plaintext)
 		}
 		for i := 0; i < len(comms); i++ {
-			if strings.Index(comms[i], args[0]+" ") == 0 || strings.Index(comms[i], args[0]+"^") == 0 {
+			if strings.Index(comms[i], args[0]+" ") == 0 || strings.Index(comms[i], args[0]+"^^") == 0 {
 				executeCommand(comms[i])
 				break
 			}
