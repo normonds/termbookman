@@ -1,0 +1,20 @@
+[package]
+name = "rust-dashboard"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ratatui = "0.26"
+crossterm = { version = "0.27", features = ["event-stream"] }
+sysinfo = "0.30"
+tokio = { version = "1.36", features = ["full"] }
+futures = "0.3"
+portable-pty = "0.8"
+unicode-width = "0.1"
+tui-term = "0.1.0"
+vte = "0.11"
+vt100 = "0.16.2"
+chrono = "0.4.44"
+
+[patch.crates-io]
+vt100 = { path = "patch/vt100" }

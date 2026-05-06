@@ -1,0 +1,43 @@
+# Summary of Terminal Pane Rendering Issues
+
+## 1. nvtop Character Set Issues (Active Focus)
+- **Observation:** Box-drawing characters (vertical/horizontal lines) are displayed as literal ASCII characters: 'q' (horizontal), 'x' (vertical), 'l' (top-left), 'k' (top-right), 'm' (bottom-left), 'j' (bottom-right).
+- **Technical Analysis:** 
+    - This is the VT100 "Alternate Character Set" (ACS) or "Line Drawing Mode."
+    - The `vt100` parser version 0.16.2 correctly receives the escape sequences, but `cell.contents()` returns the raw ASCII characters instead of the mapped Unicode symbols.
+    - `vt100::Cell` does not appear to expose a public "is_acs" or "charset" flag.
+- **Plan:** Implement a manual mapping layer in the rendering loop for these specific characters when they appear in a terminal context, or find a way to detect the character set from the parser.
+- **Current Status:** Working for now (using `NCURSES_NO_UTF8_ACS=1` workaround).
+
+## 2. btop Spacing Issues
+- **Observation:** Graphs and layout still occasionally exhibit spacing corruption.
+- **Technical Analysis:** 
+    - Switched to a strictly grid-faithful rendering loop using `is_wide()` and `is_wide_continuation()`.
+    - This ensures we visit every (x, y) coordinate exactly once.
+    - If issues persist, it may be due to how Ratatui's `buffer.set_string` interacts with characters that the shell *thinks* are wide but the `vt100` parser thinks are narrow (or vice versa).
+- **Current Status:** Paused for now.
+
+## 3. nano Status Bar
+- **Observation:** Successfully fixed.
+- **Resolution:** Added support for `inverse()` (REVERSED) and `underline()` (UNDERLINED) attributes.
+
+## 4. PTY Environment
+- **Status:** Set `LANG=en_US.UTF-8` in the `CommandBuilder` to ensure Unicode support.
+
+## 5. Investigation Summary (Gemini)
+- **Root Cause:** The `vt100` crate (v0.16.2), which is used for terminal parsing, does not implement handling for character set switching escape codes (e.g., `ESC ( 0` to enable the line drawing character set).
+- **Confirmation:** Direct inspection of the `vt100` crate's source code (specifically `perform.rs`) confirms that it ignores these escape sequences. The more capable `vte` crate (which `vt100` wraps) *does* handle them in its `ansi.rs` module, but `vt100` does not use this functionality.
+- **API Limitation:** The public API of `vt100::Screen` and `vt100::Cell` does not expose any information about the active character set. This makes it impossible to implement a workaround in the application code without significant effort (e.g., manually parsing escape codes via callbacks).
+- **Conclusion:** The `vt100` crate is not suitable for applications that need to correctly render output from programs like `nvtop` that rely on the VT100 Alternate Character Set.
+- **Next Steps:** The recommended solution is to replace the `vt100` crate with the `vte` crate directly. An attempt at this refactoring was made but proved to be too complex and was reverted. The alternative is to patch the local `vt100` crate source code as a temporary, non-standard fix.
+
+## 6. apt Progress Bar (Unpacking)
+- **Observation:** The progress bar during 'apt' unpacking either fails to appear (installing) or flickers briefly (uninstalling). It also leaves "ghost" duplicates in history as the screen scrolls.
+- **Technical Analysis:** 
+    - 'apt' uses advanced line-overwriting techniques or scroll regions (DECSTBM) that may not be perfectly synchronized with the terminal area height in a split-pane layout. 
+    - It appears to fallback to a simple ASCII bar ([###....]), suggesting it doesn't fully trust the terminal's reported capabilities or interactivity.
+- **Attempts to Fix:** 
+    - Set LANG=C.UTF-8, COLORTERM=truecolor.
+    - Explicitly set COLUMNS and LINES env vars.
+    - Simplified character width rendering logic in ui().
+- **Current Status:** Paused/Deferred.
