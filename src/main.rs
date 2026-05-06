@@ -661,6 +661,16 @@ fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect) {
 
                 if index < filtered.len() {
                     app.sidebar_state.select(Some(index));
+                    
+                    let sidebar_x = mouse.column.saturating_sub(list_area.x);
+                    if sidebar_x <= 1 {
+                        // Clicked the indicator part: RUN command (termbookman <label>)
+                        let (original_index, _) = filtered[index];
+                        let label = &app.sidebar_items[original_index];
+                        let exe = std::env::current_exe().unwrap_or_default();
+                        let _ = write!(app.pty_write, "{} {}\r", exe.display(), label);
+                        let _ = app.pty_write.flush();
+                    }
                 }
             }
             _ => {}
@@ -1020,13 +1030,15 @@ fn ui(f: &mut Frame, app: &mut App) {
             let indicator_style = if is_hovered {
                 Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray).bg(item_bg)
+                Style::default().fg(Color::Rgb(50, 50, 50)).bg(item_bg)
             };
 
+            let symbol = "▸";
+            
             let info = &app.sidebar_infos[*i];
             let line = Line::from(vec![
                 Span::styled(" ", Style::default().bg(item_bg)),
-                Span::styled(">", indicator_style),
+                Span::styled(symbol, indicator_style),
                 Span::styled(item.as_str(), style),
                 Span::styled(format!(" {}", info), Style::default().fg(Color::DarkGray).bg(item_bg)),
             ]);
