@@ -20,7 +20,7 @@ use std::{
 };
 use sysinfo::System;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use vt100::{Parser, MouseProtocolEncoding};
+use vt100::{Parser, MouseProtocolEncoding, MouseProtocolMode};
 
 fn log_debug(msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open("debug.log") {
@@ -35,6 +35,9 @@ struct App {
     sidebar_state: ListState,
     is_dragging_scrollbar: bool,
     is_dragging_sidebar_scrollbar: bool,
+    is_selecting: bool,
+    selection_start: Option<(u16, u16)>,
+    selection_end: Option<(u16, u16)>,
     sidebar_items: Vec<String>,
     sidebar_commands: Vec<String>,
     sidebar_infos: Vec<String>,
@@ -60,7 +63,7 @@ fn load_commands(exe_dir: &std::path::Path) -> (Vec<String>, Vec<String>, Vec<St
     let mut label_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     if let Ok(content) = std::fs::read_to_string(cmd_path) {
-        let mut last_label = None;
+        let mut last_label_base: Option<String> = None;
         let mut last_info = String::new();
         for line in content.lines() {
             let trimmed = line.trim();
@@ -70,20 +73,24 @@ fn load_commands(exe_dir: &std::path::Path) -> (Vec<String>, Vec<String>, Vec<St
             if trimmed.starts_with('#') {
                 let parts: Vec<&str> = trimmed[1..].trim().split_whitespace().collect();
                 if let Some(first) = parts.first() {
-                    let base_name = first.to_string();
-                    let count = label_counts.entry(base_name.clone()).or_insert(0);
-                    *count += 1;
-                    
-                    let final_label = if *count > 1 {
-                        format!("{}{}", base_name, *count)
-                    } else {
-                        base_name
-                    };
-                    last_label = Some(final_label);
+                    last_label_base = Some(first.to_string());
                     last_info = parts[1..].join(" ");
                 }
-            } else if let Some(label) = last_label.take() {
-                labels.push(label);
+            } else {
+                let base_name = last_label_base.clone().unwrap_or_else(|| {
+                    trimmed.split_whitespace().next().unwrap_or("cmd").to_string()
+                });
+                
+                let count = label_counts.entry(base_name.clone()).or_insert(0);
+                *count += 1;
+                
+                let final_label = if *count > 1 {
+                    format!("{}{}", base_name, *count)
+                } else {
+                    base_name
+                };
+
+                labels.push(final_label);
                 commands.push(trimmed.to_string());
                 infos.push(last_info.clone());
             }
@@ -121,6 +128,9 @@ impl App {
             start_time: Instant::now(),
             is_dragging_scrollbar: false,
             is_dragging_sidebar_scrollbar: false,
+            is_selecting: false,
+            selection_start: None,
+            selection_end: None,
             search_query: String::new(),
             is_search_focused: false,
         }
@@ -163,6 +173,59 @@ impl App {
             self.git_info = Some(format!("GIT: {} ({})", b, status));
         } else {
             self.git_info = None;
+        }
+    }
+
+    fn copy_selection(&mut self) {
+        log_debug("Copy selection triggered");
+        if let (Some(start), Some(end)) = (self.selection_start, self.selection_end) {
+            log_debug(&format!("Selection range: {:?} to {:?}", start, end));
+            let parser = self.parser.lock().unwrap();
+            let screen = parser.screen();
+            let (_, cols) = screen.size();
+            
+            let (s_row, s_col) = start;
+            let (e_row, e_col) = end;
+            let (min_row, min_col, max_row, max_col) = if s_row < e_row || (s_row == e_row && s_col <= e_col) {
+                (s_row, s_col, e_row, e_col)
+            } else {
+                (e_row, e_col, s_row, s_col)
+            };
+
+            let mut text = String::new();
+            for r in min_row..=max_row {
+                let start_c = if r == min_row { min_col } else { 0 };
+                let end_c = if r == max_row { max_col } else { (cols as u16).saturating_sub(1) };
+                
+                let mut line = String::new();
+                for c in start_c..=end_c {
+                    if let Some(cell) = screen.cell(r, c) {
+                        line.push_str(cell.contents());
+                    } else {
+                        line.push(' ');
+                    }
+                }
+                text.push_str(line.trim_end());
+                if r < max_row {
+                    text.push('\n');
+                }
+            }
+            
+            log_debug(&format!("Extracted text ({} chars): {:?}", text.len(), text));
+            match arboard::Clipboard::new() {
+                Ok(mut clipboard) => {
+                    if let Err(e) = clipboard.set_text(text) {
+                        log_debug(&format!("Clipboard set_text error: {:?}", e));
+                    } else {
+                        log_debug("Clipboard set_text success");
+                    }
+                }
+                Err(e) => {
+                    log_debug(&format!("Clipboard init error: {:?}", e));
+                }
+            }
+        } else {
+            log_debug("No selection to copy");
         }
     }
 }
@@ -332,6 +395,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     app.last_activity = Instant::now();
                     log_debug(&format!("Raw Key Event: {:?}", key));
                     
+                    if (key.code == KeyCode::Char('C') && key.modifiers.contains(KeyModifiers::CONTROL)) ||
+                       (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)) {
+                        app.copy_selection();
+                        continue;
+                    }
+
                     if key.modifiers.contains(KeyModifiers::SHIFT) {
                         match key.code {
                             KeyCode::PageUp => {
@@ -358,11 +427,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                     if app.is_search_focused {
                         match key.code {
                             KeyCode::Esc => { app.is_search_focused = false; }
-                            KeyCode::Backspace => { app.search_query.pop(); }
-                            KeyCode::Char(c) => { app.search_query.push(c); }
+                            KeyCode::Backspace => { 
+                                app.search_query.pop(); 
+                                app.sidebar_state.select(Some(0));
+                            }
+                            KeyCode::Char(c) => { 
+                                app.search_query.push(c); 
+                                app.sidebar_state.select(Some(0));
+                            }
                             KeyCode::Enter => { app.is_search_focused = false; }
                             _ => {}
                         }
+                        continue;
+                    }
+
+                    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                        let _ = app.pty_write.write_all(b"\x03");
+                        let _ = app.pty_write.flush();
                         continue;
                     }
 
@@ -494,12 +575,16 @@ fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect) {
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(chunks[1]);
     
+    let has_selection = app.selection_start.is_some() && app.selection_end.is_some();
+    let copy_width = if has_selection { 6 } else { 0 };
+
     let bar_chunks_upper = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(10),
+            Constraint::Length(8), // MENU
+            Constraint::Length(copy_width), // COPY
             Constraint::Min(0),
-            Constraint::Length(25),
+            Constraint::Length(30),
         ])
         .split(status_chunks[0]);
 
@@ -514,7 +599,13 @@ fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect) {
     if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
         if bar_chunks_upper[0].contains(Position::new(mouse.column, mouse.row)) {
             app.show_menu = !app.show_menu;
-        } else if bar_chunks_lower[1].contains(Position::new(mouse.column, mouse.row)) {
+            return;
+        }
+        if bar_chunks_upper[1].contains(Position::new(mouse.column, mouse.row)) {
+            app.copy_selection();
+            return;
+        }
+        if bar_chunks_lower[1].contains(Position::new(mouse.column, mouse.row)) {
             app.should_quit = true;
         }
     }
@@ -569,16 +660,7 @@ fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect) {
                 let index = (sidebar_y as usize).saturating_add(offset);
 
                 if index < filtered.len() {
-                    let (original_index, label) = filtered[index];
-                    app.sidebar_state.select(Some(original_index));
-                    
-                    let sidebar_x = mouse.column.saturating_sub(list_area.x);
-                    if sidebar_x <= 1 {
-                        // Clicked the '>' part: RUN command
-                        let exe = std::env::current_exe().unwrap_or_default();
-                        let _ = write!(app.pty_write, "{} {}\r", exe.display(), label);
-                        let _ = app.pty_write.flush();
-                    }
+                    app.sidebar_state.select(Some(index));
                 }
             }
             _ => {}
@@ -658,40 +740,57 @@ fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect) {
             }
             _ => {}
         }
-    } else if term_area.contains(Position::new(mouse.column, mouse.row)) {
+    } else if term_area.contains(Position::new(mouse.column, mouse.row)) || app.is_selecting {
         let (parser, writer) = (&app.parser, &mut app.pty_write);
         let mut parser = parser.lock().unwrap();
         let screen = parser.screen_mut();
 
+        let tx = mouse.column.saturating_sub(term_area.x);
+        let ty = mouse.row.saturating_sub(term_area.y);
+
+        if screen.mouse_protocol_mode() == MouseProtocolMode::None {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    app.is_selecting = true;
+                    app.selection_start = Some((ty, tx));
+                    app.selection_end = Some((ty, tx));
+                    return;
+                }
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved if app.is_selecting => {
+                    app.selection_end = Some((ty, tx));
+                    return;
+                }
+                MouseEventKind::Up(MouseButton::Left) if app.is_selecting => {
+                    app.is_selecting = false;
+                    if app.selection_start == app.selection_end {
+                        app.selection_start = None;
+                        app.selection_end = None;
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         if screen.mouse_protocol_encoding() == MouseProtocolEncoding::Sgr {
-            let x = mouse.column - term_area.x + 1;
-            let y = mouse.row - term_area.y + 1;
+            let x = mouse.column.saturating_sub(term_area.x) + 1;
+            let y = mouse.row.saturating_sub(term_area.y) + 1;
             
             let (button, event_char) = match mouse.kind {
                 MouseEventKind::Down(btn) => (btn, 'M'),
                 MouseEventKind::Up(btn) => (btn, 'm'),
-                MouseEventKind::ScrollUp => {
-                    if !screen.alternate_screen() {
-                        let current = screen.scrollback();
-                        screen.set_scrollback(current + 3);
-                        return;
-                    }
-                    (MouseButton::Left, 'M')
-                }
-                MouseEventKind::ScrollDown => {
-                    if !screen.alternate_screen() {
-                        let current = screen.scrollback();
-                        screen.set_scrollback(current.saturating_sub(3));
-                        return;
-                    }
-                    (MouseButton::Left, 'M')
-                }
+                MouseEventKind::ScrollUp => (MouseButton::Left, 'M'),
+                MouseEventKind::ScrollDown => (MouseButton::Left, 'M'),
+                MouseEventKind::Drag(btn) => (btn, 'M'),
                 _ => return, 
             };
             
             let button_code = match mouse.kind {
                 MouseEventKind::ScrollUp => 64,
                 MouseEventKind::ScrollDown => 65,
+                MouseEventKind::Drag(MouseButton::Left) => 32,
+                MouseEventKind::Drag(MouseButton::Middle) => 33,
+                MouseEventKind::Drag(MouseButton::Right) => 34,
                 _ => match button {
                     MouseButton::Left => 0,
                     MouseButton::Right => 1,
@@ -700,7 +799,6 @@ fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect) {
             };
 
             let seq = format!("\x1b[<{};{};{}{}", button_code, x, y, event_char);
-            
             let _ = writer.write_all(seq.as_bytes());
             let _ = writer.flush();
         } else {
@@ -814,6 +912,30 @@ fn ui(f: &mut Frame, app: &mut App) {
                     if cell.italic() { style = style.add_modifier(Modifier::ITALIC); }
                     if cell.inverse() { style = style.add_modifier(Modifier::REVERSED); }
                     if cell.underline() { style = style.add_modifier(Modifier::UNDERLINED); }
+                    
+                    if let (Some(start), Some(end)) = (app.selection_start, app.selection_end) {
+                        let (s_row, s_col) = start;
+                        let (e_row, e_col) = end;
+                        let (min_row, min_col, max_row, max_col) = if s_row < e_row || (s_row == e_row && s_col <= e_col) {
+                            (s_row, s_col, e_row, e_col)
+                        } else {
+                            (e_row, e_col, s_row, s_col)
+                        };
+                        let is_selected = if row > min_row && row < max_row {
+                            true
+                        } else if row == min_row && row == max_row {
+                            col >= min_col && col <= max_col
+                        } else if row == min_row {
+                            col >= min_col
+                        } else if row == max_row {
+                            col <= max_col
+                        } else {
+                            false
+                        };
+                        if is_selected {
+                            style = style.bg(Color::Rgb(80, 80, 80)).fg(Color::White);
+                        }
+                    }
 
                     let symbol = cell.contents();
                     let draw_sym = if symbol.is_empty() { " " } else { symbol };
@@ -835,7 +957,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(0)])
             .split(sidebar_area);
-        let search_area = sidebar_layout[0];
+        let _search_area = sidebar_layout[0];
         let list_area = sidebar_layout[1];
         
         let search_style = if app.is_search_focused {
@@ -857,8 +979,9 @@ fn ui(f: &mut Frame, app: &mut App) {
         let filtered_items: Vec<(usize, &String)> = app.sidebar_items.iter().enumerate()
             .filter(|(i, label)| {
                 let info = &app.sidebar_infos[*i];
-                label.to_lowercase().contains(&app.search_query.to_lowercase()) ||
-                info.to_lowercase().contains(&app.search_query.to_lowercase())
+                let query = app.search_query.to_lowercase();
+                let matched = label.to_lowercase().contains(&query) || info.to_lowercase().contains(&query);
+                matched
             })
             .collect();
 
@@ -873,7 +996,7 @@ fn ui(f: &mut Frame, app: &mut App) {
 
             let item_bg = if is_app_active {
                 Color::Black
-            } else if app.sidebar_state.selected() == Some(*i) {
+            } else if app.sidebar_state.selected() == Some(idx) {
                 Color::Rgb(60, 60, 60)
             } else {
                 Color::Black
@@ -881,7 +1004,7 @@ fn ui(f: &mut Frame, app: &mut App) {
 
             let style = if is_app_active {
                 Style::default().fg(Color::DarkGray).bg(item_bg)
-            } else if app.sidebar_state.selected() == Some(*i) {
+            } else if app.sidebar_state.selected() == Some(idx) {
                 Style::default().fg(color).bg(item_bg).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(color).bg(item_bg)
@@ -942,10 +1065,14 @@ fn ui(f: &mut Frame, app: &mut App) {
             .constraints([Constraint::Length(1), Constraint::Length(1)])
             .split(chunks[1]);
             
+        let has_selection = app.selection_start.is_some() && app.selection_end.is_some();
+        let copy_width = if has_selection { 6 } else { 0 };
+
         let bar_chunks_upper = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(10),
+                Constraint::Length(8), // MENU
+                Constraint::Length(copy_width), // COPY
                 Constraint::Min(0),
                 Constraint::Length(30),
             ])
@@ -958,11 +1085,33 @@ fn ui(f: &mut Frame, app: &mut App) {
                 Constraint::Length(10),
             ])
             .split(status_chunks[1]);
+            
+        let is_menu_hovered = if let Some((mx, my)) = app.mouse_pos {
+            bar_chunks_upper[0].contains(Position::new(mx, my))
+        } else { false };
+        
+        let is_copy_hovered = if has_selection {
+            if let Some((mx, my)) = app.mouse_pos {
+                bar_chunks_upper[1].contains(Position::new(mx, my))
+            } else { false }
+        } else { false };
 
-        let menu_span = Span::styled(" ≡ MENU ", Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD));
-        let exit_span = Span::styled(" EXIT ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD));
+        let is_exit_hovered = if let Some((mx, my)) = app.mouse_pos {
+            bar_chunks_lower[1].contains(Position::new(mx, my))
+        } else { false };
+
+        let menu_bg = if is_menu_hovered { Color::Rgb(150, 255, 150) } else { Color::Green };
+        let copy_bg = if is_copy_hovered { Color::Rgb(150, 255, 255) } else { Color::Cyan };
+        let exit_bg = if is_exit_hovered { Color::Rgb(255, 100, 100) } else { Color::Red };
+
+        let menu_span = Span::styled(" ≡ MENU ", Style::default().bg(menu_bg).fg(Color::Black).add_modifier(Modifier::BOLD));
+        let copy_span = Span::styled(" COPY ", Style::default().bg(copy_bg).fg(Color::Black).add_modifier(Modifier::BOLD));
+        let exit_span = Span::styled(" EXIT ", Style::default().bg(exit_bg).fg(Color::White).add_modifier(Modifier::BOLD));
         
         f.render_widget(Paragraph::new(menu_span).style(Style::default().bg(Color::Black)), bar_chunks_upper[0]);
+        if has_selection {
+            f.render_widget(Paragraph::new(copy_span).style(Style::default().bg(Color::Black)), bar_chunks_upper[1]);
+        }
         
         if let Some(idx) = app.sidebar_state.selected() {
             if idx < app.sidebar_items.len() {
@@ -970,12 +1119,13 @@ fn ui(f: &mut Frame, app: &mut App) {
                 let info = &app.sidebar_infos[idx];
                 let cmd = &app.sidebar_commands[idx];
                 let status_line = Line::from(vec![
-                    Span::styled(format!("# {} {} ", label, info), Style::default().fg(Color::White)),
+                    Span::styled(" # ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{} {} ", label, info), Style::default().fg(Color::White)),
                     Span::styled(cmd.to_string(), Style::default().fg(Color::DarkGray)),
                 ]);
                 f.render_widget(
                     Paragraph::new(status_line).style(Style::default().bg(Color::Black)),
-                    bar_chunks_upper[1]
+                    bar_chunks_upper[2]
                 );
             }
         }
@@ -991,7 +1141,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             Paragraph::new(Span::styled(clock_str, Style::default().fg(Color::White)))
                 .alignment(ratatui::layout::Alignment::Right)
                 .style(Style::default().bg(Color::Black)), 
-            bar_chunks_upper[2]
+            bar_chunks_upper[3]
         );
 
         let cpu_color = if app.cpu_usage > 80.0 { Color::Red } else { Color::Yellow };
