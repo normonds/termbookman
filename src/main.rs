@@ -21,6 +21,13 @@ use std::{
 use sysinfo::System;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use vt100::{Parser, MouseProtocolEncoding, MouseProtocolMode};
+use std::sync::mpsc;
+
+enum Message {
+    Event(Event),
+    PtyData,
+    Tick,
+}
 
 fn log_debug(msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open("debug.log") {
@@ -41,6 +48,9 @@ struct App {
     sidebar_items: Vec<String>,
     sidebar_commands: Vec<String>,
     sidebar_infos: Vec<String>,
+    sidebar_width: u16,
+    is_dragging_sidebar: bool,
+    is_dragging_term_scrollbar: bool,
     show_menu: bool,
     mouse_pos: Option<(u16, u16)>,
     parser: Arc<Mutex<Parser>>,
@@ -118,6 +128,9 @@ impl App {
             sidebar_items,
             sidebar_commands,
             sidebar_infos,
+            sidebar_width: 40,
+            is_dragging_sidebar: false,
+            is_dragging_term_scrollbar: false,
             show_menu: false,
             mouse_pos: None,
             parser,
@@ -338,24 +351,43 @@ fn main() -> Result<(), Box<dyn Error>> {
     let parser = Arc::new(Mutex::new(Parser::new(rows, cols, 1000)));
     let parser_clone = Arc::clone(&parser);
 
+    let (tx, rx) = mpsc::channel();
+    let pty_tx = tx.clone();
+    let event_tx = tx.clone();
+    let tick_tx = tx.clone();
+
     std::thread::spawn(move || {
         let mut buffer = [0u8; 4096];
         loop {
             match reader.read(&mut buffer) {
                 Ok(n) if n > 0 => {
-                    let data = &buffer[..n];
-                    log_debug(&format!("PTY Read: {} bytes", n));
-                    let mut p = parser_clone.lock().unwrap();
-                    p.process(data);
+                    {
+                        let mut p = parser_clone.lock().unwrap();
+                        p.process(&buffer[..n]);
+                    }
+                    let _ = pty_tx.send(Message::PtyData);
                 }
-                Ok(_) => {
-                    log_debug("PTY Read: 0 bytes (EOF)");
+                Ok(_) => break,
+                Err(_) => break,
+            }
+        }
+    });
+
+    std::thread::spawn(move || {
+        loop {
+            if let Ok(event) = event::read() {
+                if let Err(_) = event_tx.send(Message::Event(event)) {
                     break;
                 }
-                Err(e) => {
-                    log_debug(&format!("PTY Read Error: {}", e));
-                    break;
-                }
+            }
+        }
+    });
+
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(1000));
+            if let Err(_) = tick_tx.send(Message::Tick) {
+                break;
             }
         }
     });
@@ -370,14 +402,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut app = App::new(pty_write, master, parser, sidebar_items, sidebar_commands, sidebar_infos);
     
     let mut sys = System::new_all();
-    let tick_rate = Duration::from_millis(500);
-    let mut last_tick = Instant::now();
 
     loop {
         if app.should_quit { break; }
         
         if let Ok(Some(_)) = child.try_wait() {
-            log_debug("Child process exited.");
             break;
         }
 
@@ -385,133 +414,128 @@ fn main() -> Result<(), Box<dyn Error>> {
             ui(f, &mut app);
         })?;
 
-        let timeout = tick_rate
-            .checked_sub(last_tick.elapsed())
-            .unwrap_or_else(|| Duration::from_secs(0));
-
-        if event::poll(timeout)? {
-            match event::read()? {
-                Event::Key(key) => {
-                    app.last_activity = Instant::now();
-                    log_debug(&format!("Raw Key Event: {:?}", key));
-                    
-                    if (key.code == KeyCode::Char('C') && key.modifiers.contains(KeyModifiers::CONTROL)) ||
-                       (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)) {
-                        app.copy_selection();
-                        continue;
-                    }
-
-                    if key.modifiers.contains(KeyModifiers::SHIFT) {
-                        match key.code {
-                            KeyCode::PageUp => {
-                                let mut p = app.parser.lock().unwrap();
-                                let current = p.screen().scrollback();
-                                p.screen_mut().set_scrollback(current + 20);
-                                continue;
-                            }
-                            KeyCode::PageDown => {
-                                let mut p = app.parser.lock().unwrap();
-                                let current = p.screen().scrollback();
-                                p.screen_mut().set_scrollback(current.saturating_sub(20));
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    {
-                        let mut p = app.parser.lock().unwrap();
-                        p.screen_mut().set_scrollback(0);
-                    }
-
-                    if app.is_search_focused {
-                        match key.code {
-                            KeyCode::Esc => { app.is_search_focused = false; }
-                            KeyCode::Backspace => { 
-                                app.search_query.pop(); 
-                                app.sidebar_state.select(Some(0));
-                            }
-                            KeyCode::Char(c) => { 
-                                app.search_query.push(c); 
-                                app.sidebar_state.select(Some(0));
-                            }
-                            KeyCode::Enter => { app.is_search_focused = false; }
-                            _ => {}
-                        }
-                        continue;
-                    }
-
-                    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                        let _ = app.pty_write.write_all(b"\x03");
-                        let _ = app.pty_write.flush();
-                        continue;
-                    }
-
-                    if key.modifiers.contains(KeyModifiers::CONTROL) {
-                        match key.code {
-                            KeyCode::Char(c) => {
-                                let n = c as u8;
-                                if (97..=122).contains(&n) {
-                                    let _ = app.pty_write.write_all(&[n - 96]);
-                                } else if (65..=90).contains(&n) {
-                                    let _ = app.pty_write.write_all(&[n - 64]);
-                                } else if c == '[' { let _ = app.pty_write.write_all(&[27]); }
-                                else if c == '\\' { let _ = app.pty_write.write_all(&[28]); }
-                                else if c == ']' { let _ = app.pty_write.write_all(&[29]); }
-                                else if c == '^' { let _ = app.pty_write.write_all(&[30]); }
-                                else if c == '_' { let _ = app.pty_write.write_all(&[31]); }
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        match key.code {
-                            KeyCode::Esc => { let _ = write!(app.pty_write, "\x1b"); }
-                            KeyCode::Char(c) => { 
-                                if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'q' {
-                                    app.should_quit = true;
-                                } else {
-                                    let _ = write!(app.pty_write, "{}", c); 
-                                }
-                            }
-                            KeyCode::Enter => { let _ = write!(app.pty_write, "\r"); }
-                            KeyCode::Backspace => { let _ = write!(app.pty_write, "\x7f"); }
-                            KeyCode::Tab => { let _ = write!(app.pty_write, "	"); }
-                            KeyCode::Up => { let _ = write!(app.pty_write, "\x1b[A"); }
-                            KeyCode::Down => { let _ = write!(app.pty_write, "\x1b[B"); }
-                            KeyCode::Right => { let _ = write!(app.pty_write, "\x1b[C"); }
-                            KeyCode::Left => { let _ = write!(app.pty_write, "\x1b[D"); }
-                            KeyCode::Home => { let _ = write!(app.pty_write, "\x1b[H"); }
-                            KeyCode::End => { let _ = write!(app.pty_write, "\x1b[F"); }
-                            KeyCode::PageUp => { let _ = write!(app.pty_write, "\x1b[5~"); }
-                            KeyCode::PageDown => { let _ = write!(app.pty_write, "\x1b[6~"); }
-                            KeyCode::Delete => { let _ = write!(app.pty_write, "\x1b[3~"); }
-                            KeyCode::F(n) => {
-                                let seq = match n {
-                                    1 => "\x1bOP", 2 => "\x1bOQ", 3 => "\x1bOR", 4 => "\x1bOS",
-                                    5 => "\x1b[15~", 6 => "\x1b[17~", 7 => "\x1b[18~", 8 => "\x1b[19~",
-                                    9 => "\x1b[20~", 10 => "\x1b[21~", 11 => "\x1b[23~", 12 => "\x1b[24~",
-                                    _ => ""
-                                };
-                                let _ = write!(app.pty_write, "{}", seq);
-                            }
-                            _ => {}
-                        }
-                    }
-                    let _ = app.pty_write.flush();
-                }
-                Event::Mouse(mouse) => {
-                    app.last_activity = Instant::now();
-                    app.mouse_pos = Some((mouse.column, mouse.row));
-                    handle_click(&mut app, mouse, terminal.size()?);
-                }
-                _ => {}
+        match rx.recv()? {
+            Message::PtyData => {
+                // Just wake up to redraw
             }
-        }
+            Message::Tick => {
+                app.update_stats(&mut sys);
+            }
+            Message::Event(event) => {
+                match event {
+                    Event::Key(key) => {
+                        app.last_activity = Instant::now();
+                        
+                        if (key.code == KeyCode::Char('C') && key.modifiers.contains(KeyModifiers::CONTROL)) ||
+                           (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT)) {
+                            app.copy_selection();
+                            continue;
+                        }
 
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            match key.code {
+                                KeyCode::PageUp => {
+                                    let mut p = app.parser.lock().unwrap();
+                                    let current = p.screen().scrollback();
+                                    p.screen_mut().set_scrollback(current + 20);
+                                    continue;
+                                }
+                                KeyCode::PageDown => {
+                                    let mut p = app.parser.lock().unwrap();
+                                    let current = p.screen().scrollback();
+                                    p.screen_mut().set_scrollback(current.saturating_sub(20));
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
 
-        if last_tick.elapsed() >= tick_rate {
-            app.update_stats(&mut sys);
-            last_tick = Instant::now();
+                        {
+                            let mut p = app.parser.lock().unwrap();
+                            p.screen_mut().set_scrollback(0);
+                        }
+
+                        if app.is_search_focused {
+                            match key.code {
+                                KeyCode::Esc => { app.is_search_focused = false; }
+                                KeyCode::Backspace => { 
+                                    app.search_query.pop(); 
+                                    app.sidebar_state.select(Some(0));
+                                }
+                                KeyCode::Char(c) => { 
+                                    app.search_query.push(c); 
+                                    app.sidebar_state.select(Some(0));
+                                }
+                                KeyCode::Enter => { app.is_search_focused = false; }
+                                _ => {}
+                            }
+                            continue;
+                        }
+
+                        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                            let _ = app.pty_write.write_all(b"\x03");
+                            let _ = app.pty_write.flush();
+                            continue;
+                        }
+
+                        if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            match key.code {
+                                KeyCode::Char(c) => {
+                                    let n = c as u8;
+                                    if (97..=122).contains(&n) {
+                                        let seq = format!("\x1b{}", (n - 96) as char);
+                                        let _ = app.pty_write.write_all(seq.as_bytes());
+                                    } else if c == '[' {
+                                        let _ = app.pty_write.write_all(b"\x1b");
+                                    }
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            match key.code {
+                                KeyCode::Char(c) => { let _ = write!(app.pty_write, "{}", c); }
+                                KeyCode::Enter => { let _ = app.pty_write.write_all(b"\r"); }
+                                KeyCode::Backspace => { let _ = app.pty_write.write_all(b"\x08"); }
+                                KeyCode::Tab => { let _ = app.pty_write.write_all(b"\x09"); }
+                                KeyCode::Esc => { let _ = app.pty_write.write_all(b"\x1b"); }
+                                KeyCode::Up => { let _ = app.pty_write.write_all(b"\x1b[A"); }
+                                KeyCode::Down => { let _ = app.pty_write.write_all(b"\x1b[B"); }
+                                KeyCode::Right => { let _ = app.pty_write.write_all(b"\x1b[C"); }
+                                KeyCode::Left => { let _ = app.pty_write.write_all(b"\x1b[D"); }
+                                KeyCode::Home => { let _ = app.pty_write.write_all(b"\x1b[H"); }
+                                KeyCode::End => { let _ = app.pty_write.write_all(b"\x1b[F"); }
+                                KeyCode::Delete => { let _ = app.pty_write.write_all(b"\x1b[3~"); }
+                                KeyCode::F(n) => {
+                                    let seq = match n {
+                                        1..=4 => format!("\x1bO{}", (n as u8 + 79) as char),
+                                        5 => "\x1b[15~".to_string(),
+                                        6 => "\x1b[17~".to_string(),
+                                        7 => "\x1b[18~".to_string(),
+                                        8 => "\x1b[19~".to_string(),
+                                        9 => "\x1b[20~".to_string(),
+                                        10 => "\x1b[21~".to_string(),
+                                        11 => "\x1b[23~".to_string(),
+                                        12 => "\x1b[24~".to_string(),
+                                        _ => "".to_string(),
+                                    };
+                                    let _ = write!(app.pty_write, "{}", seq);
+                                }
+                                _ => {}
+                            }
+                        }
+                        let _ = app.pty_write.flush();
+                    }
+                    Event::Mouse(mouse) => {
+                        app.last_activity = Instant::now();
+                        app.mouse_pos = Some((mouse.column, mouse.row));
+                        handle_click(&mut app, mouse, terminal.size()?);
+                    }
+                    Event::Resize(_w, _h) => {
+                        // Redraw handled by recv
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -529,46 +553,69 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect) {
-    let chunks = if size.height < 26 {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Fill(1), Constraint::Length(0)])
-            .split(size)
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Fill(1), Constraint::Length(2)])
-            .split(size)
-    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Fill(1), Constraint::Length(2)])
+        .split(size);
 
-    let top_chunks = if size.width < 106 {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Fill(1), Constraint::Length(0)])
-            .split(chunks[0])
-    } else {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Fill(1), Constraint::Length(25)])
-            .split(chunks[0])
-    };
+    let top_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Fill(1), Constraint::Length(app.sidebar_width)])
+        .split(chunks[0]);
 
     let term_area = top_chunks[0];
     let right_pane = top_chunks[1];
-    
+
     let right_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Length(0),
-            Constraint::Fill(1),
-            Constraint::Length(1),
+            Constraint::Length(1), // Terminal Scrollbar / Resize Handle
+            Constraint::Length(0), 
+            Constraint::Fill(1),   // Sidebar Items
+            Constraint::Length(1), // Sidebar Scrollbar
         ])
         .split(right_pane);
 
     let scrollbar_area = right_layout[0];
     let sidebar_area = right_layout[2];
     let sidebar_scrollbar_area = right_layout[3];
+
+    if let MouseEventKind::Up(MouseButton::Left) = mouse.kind {
+        app.is_dragging_sidebar = false;
+        app.is_dragging_term_scrollbar = false;
+        app.is_dragging_sidebar_scrollbar = false;
+    }
+
+    if app.is_dragging_term_scrollbar {
+        let mut p = app.parser.lock().unwrap();
+        let screen = p.screen();
+        let history_len = screen.scrollback_len();
+        if history_len > 0 {
+            let relative_y = mouse.row.saturating_sub(scrollbar_area.y) as f32;
+            let percent = relative_y / scrollbar_area.height as f32;
+            let new_pos = (percent * history_len as f32) as usize;
+            let target_offset = history_len.saturating_sub(new_pos);
+            p.screen_mut().set_scrollback(target_offset);
+        }
+        return;
+    }
+
+    if app.is_dragging_sidebar {
+        let new_width = size.width.saturating_sub(mouse.column);
+        app.sidebar_width = new_width.clamp(10, size.width.saturating_sub(20));
+        return;
+    }
+
+    if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+        if scrollbar_area.contains(Position::new(mouse.column, mouse.row)) {
+            if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+                app.is_dragging_sidebar = true;
+            } else {
+                app.is_dragging_term_scrollbar = true;
+            }
+            return;
+        }
+    }
 
     let status_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -830,47 +877,34 @@ fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect) {
 fn ui(f: &mut Frame, app: &mut App) {
     let size = f.size();
 
-    let chunks = if size.height < 26 {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Fill(1), Constraint::Length(0)])
-            .split(size)
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Fill(1), Constraint::Length(2)])
-            .split(size)
-    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Fill(1), Constraint::Length(2)])
+        .split(size);
 
-    let top_chunks = if size.width < 106 {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Fill(1), Constraint::Length(0)])
-            .split(chunks[0])
-    } else {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Fill(1), Constraint::Length(25)])
-            .split(chunks[0])
-    };
+    let top_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Fill(1), Constraint::Length(app.sidebar_width)])
+        .split(chunks[0]);
 
     let term_area = top_chunks[0];
     let right_pane = top_chunks[1];
-    f.render_widget(Block::default().style(Style::default().bg(Color::Black)), right_pane);
     
     let right_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Length(0),
-            Constraint::Fill(1),
-            Constraint::Length(1),
+            Constraint::Length(1), // Terminal Scrollbar / Resize Handle
+            Constraint::Length(0), 
+            Constraint::Fill(1),   // Sidebar Items
+            Constraint::Length(1), // Sidebar Scrollbar
         ])
         .split(right_pane);
 
     let scrollbar_area = right_layout[0];
     let sidebar_area = right_layout[2];
     let sidebar_scrollbar_area = right_layout[3];
+    
+    f.render_widget(Block::default().style(Style::default().bg(Color::Black)), right_pane);
 
     {
         let mut parser = app.parser.lock().unwrap();
@@ -1012,22 +1046,28 @@ fn ui(f: &mut Frame, app: &mut App) {
                 Color::Black
             };
 
+            let offset = app.sidebar_state.offset();
+            let is_row_hovered = if let Some((mx, my)) = app.mouse_pos {
+                list_area.contains(Position::new(mx, my)) && 
+                my == list_area.y + (idx as u16).saturating_sub(offset as u16) && 
+                idx >= offset && idx < offset + list_area.height as usize
+            } else {
+                false
+            };
+
+            let is_button_hovered = is_row_hovered && if let Some((mx, _)) = app.mouse_pos {
+                mx == list_area.x + 1
+            } else { false };
+
             let style = if is_app_active {
                 Style::default().fg(Color::DarkGray).bg(item_bg)
-            } else if app.sidebar_state.selected() == Some(idx) {
+            } else if app.sidebar_state.selected() == Some(idx) || is_row_hovered {
                 Style::default().fg(color).bg(item_bg).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(color).bg(item_bg)
             };
             
-            let offset = app.sidebar_state.offset();
-            let is_hovered = if let Some((mx, my)) = app.mouse_pos {
-                mx == list_area.x + 1 && my == list_area.y + (idx as u16).saturating_sub(offset as u16) && idx >= offset && idx < offset + list_area.height as usize
-            } else {
-                false
-            };
-
-            let indicator_style = if is_hovered {
+            let indicator_style = if is_button_hovered {
                 Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Rgb(50, 50, 50)).bg(item_bg)
@@ -1036,11 +1076,17 @@ fn ui(f: &mut Frame, app: &mut App) {
             let symbol = "▸";
             
             let info = &app.sidebar_infos[*i];
+            let info_style = if is_row_hovered || app.sidebar_state.selected() == Some(idx) {
+                Style::default().fg(Color::DarkGray).bg(item_bg).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray).bg(item_bg)
+            };
+
             let line = Line::from(vec![
                 Span::styled(" ", Style::default().bg(item_bg)),
                 Span::styled(symbol, indicator_style),
                 Span::styled(item.as_str(), style),
-                Span::styled(format!(" {}", info), Style::default().fg(Color::DarkGray).bg(item_bg)),
+                Span::styled(format!(" {}", info), info_style),
             ]);
             ListItem::new(line).style(Style::default().bg(item_bg))
         }).collect();
@@ -1059,6 +1105,10 @@ fn ui(f: &mut Frame, app: &mut App) {
         let mut sidebar_scrollbar_state = ScrollbarState::new(filtered_items.len())
             .position(sidebar_scroll_pos);
 
+        let is_sidebar_scrollbar_hovered = if let Some((mx, my)) = app.mouse_pos {
+            sidebar_scrollbar_area.contains(Position::new(mx, my))
+        } else { false };
+
         f.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
@@ -1066,7 +1116,11 @@ fn ui(f: &mut Frame, app: &mut App) {
                 .track_symbol(Some(" "))
                 .thumb_symbol("┃")
                 .track_style(Style::default().bg(Color::Black).fg(Color::Rgb(20, 20, 20)))
-                .thumb_style(Style::default().fg(Color::Rgb(50, 50, 50))),
+                .thumb_style(if is_sidebar_scrollbar_hovered || app.is_dragging_sidebar_scrollbar {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(Color::Rgb(50, 50, 50))
+                }),
             sidebar_scrollbar_area,
             &mut sidebar_scrollbar_state,
         );
@@ -1077,7 +1131,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             .constraints([Constraint::Length(1), Constraint::Length(1)])
             .split(chunks[1]);
             
-        let has_selection = app.selection_start.is_some() && app.selection_end.is_some();
+        let has_selection = app.selection_start.is_some() && app.selection_end.is_some() && !app.is_selecting;
         let copy_width = if has_selection { 6 } else { 0 };
 
         let bar_chunks_upper = Layout::default()
@@ -1094,7 +1148,8 @@ fn ui(f: &mut Frame, app: &mut App) {
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Min(0),
-                Constraint::Length(10),
+                Constraint::Length(25), // Stats
+                Constraint::Length(10), // EXIT
             ])
             .split(status_chunks[1]);
             
@@ -1148,29 +1203,44 @@ fn ui(f: &mut Frame, app: &mut App) {
         let total_lines = rows as usize + history_len; 
         let line_info = format!("{}/{}", scroll_offset, total_lines);
         
-        let clock_str = format!("{} | {}", line_info, chrono::Local::now().format("%H:%M:%S"));
+
+        let stats_line = Line::from(vec![
+            Span::styled(format!("{} | {}", line_info, chrono::Local::now().format("%H:%M:%S")), Style::default().fg(Color::White)),
+        ]);
+
         f.render_widget(
-            Paragraph::new(Span::styled(clock_str, Style::default().fg(Color::White)))
+            Paragraph::new(stats_line)
                 .alignment(ratatui::layout::Alignment::Right)
                 .style(Style::default().bg(Color::Black)), 
             bar_chunks_upper[3]
         );
 
-        let cpu_color = if app.cpu_usage > 80.0 { Color::Red } else { Color::Yellow };
         let git_str = app.git_info.as_deref().unwrap_or("");
-        let line2 = Line::from(vec![
-            Span::styled(format!("CPU: {:.0}%", app.cpu_usage.round()), Style::default().fg(cpu_color)),
-            Span::raw(" | "),
-            Span::styled(format!("MEM: {}GB/{}GB", (app.mem_usage.0 as f64 / 1_073_741_824.0).round() as u64, (app.mem_usage.1 as f64 / 1_073_741_824.0).round() as u64), Style::default().fg(Color::Cyan)),
-            Span::raw(" | "),
-            Span::styled(git_str, Style::default().fg(Color::Magenta)),
-        ]);
-        f.render_widget(Paragraph::new(line2).style(Style::default().bg(Color::Black)), bar_chunks_lower[0]);
+        f.render_widget(
+            Paragraph::new(Span::styled(git_str, Style::default().fg(Color::Magenta)))
+                .style(Style::default().bg(Color::Black)), 
+            bar_chunks_lower[0]
+        );
+
+        let cpu_color = if app.cpu_usage > 80.0 { Color::Red } else { Color::Yellow };
+        let cpu_mem_str = format!("{:.0}% {}/{}GB", 
+            app.cpu_usage.round(), 
+            (app.mem_usage.0 as f64 / 1_073_741_824.0).round() as u64, 
+            (app.mem_usage.1 as f64 / 1_073_741_824.0).round() as u64
+        );
+
+        f.render_widget(
+            Paragraph::new(Span::styled(cpu_mem_str, Style::default().fg(cpu_color)))
+                .alignment(ratatui::layout::Alignment::Right)
+                .style(Style::default().bg(Color::Black)), 
+            bar_chunks_lower[1]
+        );
+
         f.render_widget(
             Paragraph::new(exit_span)
                 .alignment(ratatui::layout::Alignment::Right)
                 .style(Style::default().bg(Color::Black)), 
-            bar_chunks_lower[1]
+            bar_chunks_lower[2]
         );
 
         f.render_widget(Block::default().style(Style::default().bg(Color::Black)), scrollbar_area);
@@ -1180,6 +1250,18 @@ fn ui(f: &mut Frame, app: &mut App) {
         let mut scrollbar_state = ScrollbarState::new(history_len)
             .position(scroll_pos);
 
+        let is_term_scrollbar_hovered = if let Some((mx, my)) = app.mouse_pos {
+            scrollbar_area.contains(Position::new(mx, my))
+        } else { false };
+
+        let term_scrollbar_color = if app.is_dragging_sidebar {
+            Color::Yellow
+        } else if is_term_scrollbar_hovered || app.is_dragging_term_scrollbar { 
+            Color::White 
+        } else { 
+            Color::Rgb(60, 60, 60) 
+        };
+
         f.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("▲"))
@@ -1187,9 +1269,9 @@ fn ui(f: &mut Frame, app: &mut App) {
                 .track_symbol(Some("│"))
                 .thumb_symbol("┃")
                 .track_style(Style::default().fg(Color::Rgb(30, 30, 30)))
-                .thumb_style(Style::default().fg(Color::Rgb(60, 60, 60)))
-                .begin_style(Style::default().fg(Color::Rgb(60, 60, 60)))
-                .end_style(Style::default().fg(Color::Rgb(60, 60, 60))),
+                .thumb_style(Style::default().fg(term_scrollbar_color))
+                .begin_style(Style::default().fg(term_scrollbar_color))
+                .end_style(Style::default().fg(term_scrollbar_color)),
             scrollbar_area,
             &mut scrollbar_state,
         );

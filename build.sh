@@ -2,8 +2,9 @@
 # Build the production version of the dashboard
 cargo build --release
 
-# Copy the resulting binary to the project root
-cp target/release/rust-dashboard ./termbookman
+# Remove old binary to avoid 'Text file busy' and copy the new one
+rm -f ./termbookman
+cp target/release/rust-dashboard ./termbookman || { echo "ERROR: Could not replace ./termbookman. Is it still running?"; exit 1; }
 
 echo "------------------------------------------------"
 echo "Build complete! Production binary: ./termbookman"
