@@ -742,7 +742,7 @@ fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect) {
         .split(status_chunks[0]);
 
     let has_git = app.git_info.is_some();
-    let git_btns_width = if has_git { 21 } else { 0 };
+    let git_btns_width = if has_git { 29 } else { 0 };
 
     let bar_chunks_lower = Layout::default()
         .direction(Direction::Horizontal)
