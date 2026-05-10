@@ -61,6 +61,11 @@ struct App {
     start_time: Instant,
     search_query: String,
     is_search_focused: bool,
+    show_history: bool,
+    history_items: Vec<String>,
+    history_commands: Vec<String>,
+    shell_pid: u32,
+    is_pty_busy: bool,
 }
 
 
@@ -103,6 +108,10 @@ fn load_commands(exe_dir: &std::path::Path) -> (Vec<String>, Vec<String>, Vec<St
                 labels.push(final_label);
                 commands.push(trimmed.to_string());
                 infos.push(last_info.clone());
+                
+                // Reset for next potential command
+                last_label_base = None;
+                last_info = String::new();
             }
         }
     }
@@ -117,6 +126,7 @@ impl App {
         sidebar_items: Vec<String>,
         sidebar_commands: Vec<String>,
         sidebar_infos: Vec<String>,
+        shell_pid: u32,
     ) -> App {
         let mut state = ListState::default();
         state.select(Some(0));
@@ -146,14 +156,73 @@ impl App {
             selection_end: None,
             search_query: String::new(),
             is_search_focused: false,
+            show_history: false,
+            history_items: Vec::new(),
+            history_commands: Vec::new(),
+            shell_pid,
+            is_pty_busy: false,
+        }
+    }
+
+    fn refresh_history(&mut self) {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let history_path = std::path::Path::new(&home).join(".bash_history");
+        
+        self.history_items.clear();
+        self.history_commands.clear();
+
+        if let Ok(content) = std::fs::read_to_string(history_path) {
+            let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+            lines.reverse(); // Newest first
+            
+            let mut seen = std::collections::HashSet::new();
+            for line in lines {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                    self.history_items.push(trimmed.to_string());
+                    self.history_commands.push(trimmed.to_string());
+                }
+                if self.history_items.len() >= 500 { break; }
+            }
+        } else {
+            // Fallback to 'history' command if file read fails
+            if let Ok(output) = Command::new("bash").arg("-c").arg("history").output() {
+                let s = String::from_utf8_lossy(&output.stdout);
+                let mut lines: Vec<String> = s.lines().map(|s| {
+                    let parts: Vec<&str> = s.trim().split_whitespace().collect();
+                    if parts.len() > 1 { parts[1..].join(" ") } else { s.to_string() }
+                }).collect();
+                lines.reverse();
+                
+                let mut seen = std::collections::HashSet::new();
+                for line in lines {
+                    if !line.is_empty() && seen.insert(line.to_string()) {
+                        self.history_items.push(line.clone());
+                        self.history_commands.push(line);
+                    }
+                    if self.history_items.len() >= 500 { break; }
+                }
+            }
         }
     }
 
     fn update_stats(&mut self, sys: &mut System) {
         sys.refresh_cpu();
         sys.refresh_memory();
+        sys.refresh_processes();
+
         self.cpu_usage = sys.global_cpu_info().cpu_usage();
         self.mem_usage = (sys.used_memory(), sys.total_memory());
+
+        // Check if shell has children
+        self.is_pty_busy = false;
+        let shell_pid = sysinfo::Pid::from_u32(self.shell_pid);
+        for process in sys.processes().values() {
+            if process.parent() == Some(shell_pid) {
+                self.is_pty_busy = true;
+                break;
+            }
+        }
 
         // Only refresh git info every ~2 seconds (40 * 50ms) to save CPU
         static mut GIT_COUNTER: u32 = 0;
@@ -399,7 +468,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         pixel_height: 0,
     });
 
-    let mut app = App::new(pty_write, master, parser, sidebar_items, sidebar_commands, sidebar_infos);
+    let mut app = App::new(pty_write, master, parser, sidebar_items, sidebar_commands, sidebar_infos, child.process_id().unwrap_or(0));
     
     let mut sys = System::new_all();
 
@@ -580,6 +649,43 @@ fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect) {
     let sidebar_area = right_layout[2];
     let sidebar_scrollbar_area = right_layout[3];
 
+    let (mouse_mode, mouse_enc) = {
+        let parser = app.parser.lock().unwrap();
+        let screen = parser.screen();
+        (screen.mouse_protocol_mode(), screen.mouse_protocol_encoding())
+    };
+
+    if term_area.contains(Position::new(mouse.column, mouse.row)) && mouse_mode != MouseProtocolMode::None {
+        let tx = (mouse.column.saturating_sub(term_area.x) + 1) as i32;
+        let ty = (mouse.row.saturating_sub(term_area.y) + 1) as i32;
+        
+        let btn = match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => 0,
+            MouseEventKind::Down(MouseButton::Middle) => 1,
+            MouseEventKind::Down(MouseButton::Right) => 2,
+            MouseEventKind::Up(MouseButton::Left) => 0,
+            MouseEventKind::Up(MouseButton::Middle) => 1,
+            MouseEventKind::Up(MouseButton::Right) => 2,
+            MouseEventKind::Drag(MouseButton::Left) => 32,
+            MouseEventKind::Drag(MouseButton::Middle) => 33,
+            MouseEventKind::Drag(MouseButton::Right) => 34,
+            MouseEventKind::Moved => 35,
+            MouseEventKind::ScrollUp => 64,
+            MouseEventKind::ScrollDown => 65,
+            _ => 0,
+        };
+
+        let is_up = matches!(mouse.kind, MouseEventKind::Up(_));
+        let suffix = if is_up { 'm' } else { 'M' };
+        
+        if mouse_enc == MouseProtocolEncoding::Sgr {
+            let seq = format!("\x1b[<{};{};{}{}", btn, tx, ty, suffix);
+            let _ = app.pty_write.write_all(seq.as_bytes());
+            let _ = app.pty_write.flush();
+            return;
+        }
+    }
+
     if let MouseEventKind::Up(MouseButton::Left) = mouse.kind {
         app.is_dragging_sidebar = false;
         app.is_dragging_term_scrollbar = false;
@@ -635,11 +741,17 @@ fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect) {
         ])
         .split(status_chunks[0]);
 
+    let has_git = app.git_info.is_some();
+    let git_btns_width = if has_git { 21 } else { 0 };
+
     let bar_chunks_lower = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
+            Constraint::Length(git_btns_width),
             Constraint::Min(0),
-            Constraint::Length(10),
+            Constraint::Length(25), // Stats
+            Constraint::Length(1),  // Spacer
+            Constraint::Length(6),  // EXIT
         ])
         .split(status_chunks[1]);
 
@@ -652,7 +764,41 @@ fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect) {
             app.copy_selection();
             return;
         }
-        if bar_chunks_lower[1].contains(Position::new(mouse.column, mouse.row)) {
+
+        if has_git {
+            let git_btn_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(8), // STATUS
+                    Constraint::Length(6), // DIFF
+                    Constraint::Length(6), // SHOW
+                    Constraint::Length(9), // HISTORY
+                ])
+                .split(bar_chunks_lower[0]);
+            
+            if git_btn_chunks[0].contains(Position::new(mouse.column, mouse.row)) {
+                let _ = app.pty_write.write_all(b"git status\r");
+                let _ = app.pty_write.flush();
+                return;
+            }
+            if git_btn_chunks[1].contains(Position::new(mouse.column, mouse.row)) {
+                let _ = app.pty_write.write_all(b"git diff\r");
+                let _ = app.pty_write.flush();
+                return;
+            }
+            if git_btn_chunks[2].contains(Position::new(mouse.column, mouse.row)) {
+                let _ = app.pty_write.write_all(b"git show\r");
+                let _ = app.pty_write.flush();
+                return;
+            }
+            if git_btn_chunks[3].contains(Position::new(mouse.column, mouse.row)) {
+                let _ = app.pty_write.write_all(b"git log --oneline -n 20\r");
+                let _ = app.pty_write.flush();
+                return;
+            }
+        }
+
+        if bar_chunks_lower[4].contains(Position::new(mouse.column, mouse.row)) {
             app.should_quit = true;
         }
     }
@@ -662,13 +808,15 @@ fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect) {
         let screen = parser.screen();
         screen.alternate_screen() || screen.hide_cursor() || screen.application_cursor()
     };
+    let is_sidebar_locked = is_app_active || app.is_pty_busy;
 
-    let sidebar_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(sidebar_area);
-    let search_area = sidebar_layout[0];
-    let list_area = sidebar_layout[1];
+    let history_toggle_area = Rect::new(sidebar_area.x, sidebar_area.y, sidebar_area.width, 1);
+    let search_area = Rect::new(sidebar_area.x, sidebar_area.y + 1, sidebar_area.width, 1);
+    let list_area = Rect::new(sidebar_area.x, sidebar_area.y + 2, sidebar_area.width, sidebar_area.height.saturating_sub(2));
+
+    if is_sidebar_locked {
+        return;
+    }
 
     if search_area.contains(Position::new(mouse.column, mouse.row)) {
         if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
@@ -679,12 +827,28 @@ fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect) {
         app.is_search_focused = false;
     }
 
+    // Toggle History View
+    if history_toggle_area.contains(Position::new(mouse.column, mouse.row)) {
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            app.show_history = !app.show_history;
+            if app.show_history {
+                app.refresh_history();
+            }
+            app.sidebar_state.select(Some(0));
+        }
+        return;
+    }
+
     if list_area.contains(Position::new(mouse.column, mouse.row)) && !is_app_active {
-        let filtered: Vec<(usize, &String)> = app.sidebar_items.iter().enumerate()
-            .filter(|(i, label)| {
-                let info = &app.sidebar_infos[*i];
-                label.to_lowercase().contains(&app.search_query.to_lowercase()) ||
-                info.to_lowercase().contains(&app.search_query.to_lowercase())
+        let items = if app.show_history {
+            &app.history_items
+        } else {
+            &app.sidebar_items
+        };
+
+        let filtered: Vec<(usize, &String)> = items.iter().enumerate()
+            .filter(|(_, label)| {
+                label.to_lowercase().contains(&app.search_query.to_lowercase())
             })
             .collect();
 
@@ -711,11 +875,18 @@ fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect) {
                     
                     let sidebar_x = mouse.column.saturating_sub(list_area.x);
                     if sidebar_x <= 1 {
-                        // Clicked the indicator part: RUN command (termbookman <label>)
+                        // Clicked the indicator part: RUN command
                         let (original_index, _) = filtered[index];
-                        let label = &app.sidebar_items[original_index];
-                        let exe = std::env::current_exe().unwrap_or_default();
-                        let _ = write!(app.pty_write, "{} {}\r", exe.display(), label);
+                        if app.show_history {
+                            let cmd_str = &app.history_commands[original_index];
+                            let _ = app.pty_write.write_all(cmd_str.as_bytes());
+                            let _ = app.pty_write.write_all(b"\r");
+                        } else {
+                            let label = &app.sidebar_items[original_index];
+                            let exe = std::env::current_exe().unwrap_or_default();
+                            let cmd = format!("{} {}\r", exe.display(), label);
+                            let _ = app.pty_write.write_all(cmd.as_bytes());
+                        }
                         let _ = app.pty_write.flush();
                     }
                 }
@@ -920,9 +1091,12 @@ fn ui(f: &mut Frame, app: &mut App) {
         }
     }
 
+    let term_bg = if app.is_search_focused { Color::Rgb(30, 30, 30) } else { Color::Black };
     for y in term_area.top()..term_area.bottom() {
         for x in term_area.left()..term_area.right() {
-            f.buffer_mut().get_mut(x, y).reset();
+            let cell = f.buffer_mut().get_mut(x, y);
+            cell.reset();
+            cell.set_bg(term_bg);
         }
     }
 
@@ -940,7 +1114,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                         continue;
                     }
 
-                    let mut style = Style::default();
+                    let mut style = Style::default().bg(term_bg);
                     match cell.fgcolor() {
                         vt100::Color::Rgb(r, g, b) => { style = style.fg(Color::Rgb(r, g, b)); }
                         vt100::Color::Idx(i) => { style = style.fg(Color::Indexed(i)); }
@@ -996,15 +1170,43 @@ fn ui(f: &mut Frame, app: &mut App) {
         f.set_cursor(cx, cy);
 
         let is_app_active = screen.alternate_screen() || screen.hide_cursor() || screen.application_cursor();
+        let is_sidebar_locked = is_app_active || app.is_pty_busy;
         
         let sidebar_layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .constraints([
+                Constraint::Length(1), // HISTORY Toggle
+                Constraint::Length(1), // Search Bar
+                Constraint::Min(0)     // List
+            ])
             .split(sidebar_area);
-        let _search_area = sidebar_layout[0];
-        let list_area = sidebar_layout[1];
+        let history_toggle_area = sidebar_layout[0];
+        let search_area = sidebar_layout[1];
+        let list_area = sidebar_layout[2];
         
-        let search_style = if app.is_search_focused {
+        let is_history_btn_hovered = if let Some((mx, my)) = app.mouse_pos {
+            history_toggle_area.contains(Position::new(mx, my))
+        } else { false };
+
+        let (hist_text, hist_color) = if is_sidebar_locked {
+            ("  SIDEBAR DISABLED  ", Color::DarkGray)
+        } else if app.show_history {
+            ("  HISTORY VIEW  ", Color::Rgb(255, 180, 100))
+        } else {
+            ("  SAVED COMMANDS  ", Color::Rgb(150, 255, 150))
+        };
+
+        let hist_btn_bg = if is_history_btn_hovered { Color::Rgb(50, 50, 50) } else { Color::Black };
+        f.render_widget(
+            Paragraph::new(Span::styled(hist_text, Style::default().fg(hist_color).add_modifier(Modifier::BOLD)))
+                .style(Style::default().bg(hist_btn_bg))
+                .alignment(ratatui::layout::Alignment::Center),
+            history_toggle_area
+        );
+        
+        let search_style = if is_sidebar_locked {
+            Style::default().fg(Color::DarkGray).bg(Color::Black)
+        } else if app.is_search_focused {
             Style::default().fg(Color::Yellow).bg(Color::Rgb(30, 30, 30))
         } else {
             Style::default().fg(Color::DarkGray).bg(Color::Black)
@@ -1018,27 +1220,34 @@ fn ui(f: &mut Frame, app: &mut App) {
         } else {
             format!(" {}{} ", app.search_query, cursor_char)
         };
-        f.render_widget(Paragraph::new(search_text).style(search_style), sidebar_layout[0]);
+        f.render_widget(Paragraph::new(search_text).style(search_style), search_area);
 
-        let filtered_items: Vec<(usize, &String)> = app.sidebar_items.iter().enumerate()
-            .filter(|(i, label)| {
-                let info = &app.sidebar_infos[*i];
-                let query = app.search_query.to_lowercase();
-                let matched = label.to_lowercase().contains(&query) || info.to_lowercase().contains(&query);
-                matched
+        let (items, infos) = if app.show_history {
+            (&app.history_items, None)
+        } else {
+            (&app.sidebar_items, Some(&app.sidebar_infos))
+        };
+
+        let filtered_items: Vec<(usize, &String)> = items.iter().enumerate()
+            .filter(|(_, label)| {
+                label.to_lowercase().contains(&app.search_query.to_lowercase())
             })
             .collect();
 
         let sidebar_list_items: Vec<ListItem> = filtered_items.iter().enumerate().map(|(idx, (i, item))| {
-            let color = if app.sidebar_commands[*i].contains("<prompt") {
-                Color::Green
-            } else if app.sidebar_commands[*i].contains("sudo") {
-                Color::Red
+            let color = if app.show_history { 
+                Color::Rgb(200, 200, 200) 
             } else {
-                Color::White
+                if app.sidebar_commands[*i].contains("<prompt") {
+                    Color::Green
+                } else if app.sidebar_commands[*i].contains("sudo") || app.sidebar_infos[*i].to_lowercase().contains("sudo") {
+                    Color::Red
+                } else {
+                    Color::White
+                }
             };
 
-            let item_bg = if is_app_active {
+            let item_bg = if is_sidebar_locked {
                 Color::Black
             } else if app.sidebar_state.selected() == Some(idx) {
                 Color::Rgb(60, 60, 60)
@@ -1059,7 +1268,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                 mx == list_area.x + 1
             } else { false };
 
-            let style = if is_app_active {
+            let style = if is_sidebar_locked {
                 Style::default().fg(Color::DarkGray).bg(item_bg)
             } else if app.sidebar_state.selected() == Some(idx) || is_row_hovered {
                 Style::default().fg(color).bg(item_bg).add_modifier(Modifier::BOLD)
@@ -1067,7 +1276,9 @@ fn ui(f: &mut Frame, app: &mut App) {
                 Style::default().fg(color).bg(item_bg)
             };
             
-            let indicator_style = if is_button_hovered {
+            let indicator_style = if is_sidebar_locked {
+                Style::default().fg(Color::Rgb(25, 25, 25)).bg(item_bg)
+            } else if is_button_hovered {
                 Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Rgb(50, 50, 50)).bg(item_bg)
@@ -1075,18 +1286,43 @@ fn ui(f: &mut Frame, app: &mut App) {
 
             let symbol = "▸";
             
-            let info = &app.sidebar_infos[*i];
-            let info_style = if is_row_hovered || app.sidebar_state.selected() == Some(idx) {
-                Style::default().fg(Color::DarkGray).bg(item_bg).add_modifier(Modifier::BOLD)
+            let (info, is_fallback) = if let Some(infos) = infos {
+                let info_text = &infos[*i];
+                if info_text.trim().is_empty() || info_text.len() < 3 {
+                    (format!(" {}", app.sidebar_commands[*i]), true)
+                } else {
+                    (format!(" {}", info_text), false)
+                }
             } else {
-                Style::default().fg(Color::DarkGray).bg(item_bg)
+                (String::new(), false)
             };
+
+            let label_text = item;
+            let mut command_text = String::new();
+            let mut hide_info = false;
+            if label_text.len() < 20 && !app.show_history {
+                command_text = format!(" {}", app.sidebar_commands[*i]);
+                if is_fallback {
+                    hide_info = true;
+                }
+            }
+
+            let info_style = if is_fallback {
+                Style::default().fg(Color::Rgb(50, 50, 50)).bg(item_bg)
+            } else if is_row_hovered || app.sidebar_state.selected() == Some(idx) {
+                Style::default().fg(Color::Rgb(90, 90, 90)).bg(item_bg).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Rgb(90, 90, 90)).bg(item_bg)
+            };
+
+            let command_style = Style::default().fg(Color::Rgb(50, 50, 50)).bg(item_bg);
 
             let line = Line::from(vec![
                 Span::styled(" ", Style::default().bg(item_bg)),
                 Span::styled(symbol, indicator_style),
-                Span::styled(item.as_str(), style),
-                Span::styled(format!(" {}", info), info_style),
+                Span::styled(label_text.as_str(), style),
+                if hide_info { Span::raw("") } else { Span::styled(info, info_style) },
+                Span::styled(command_text, command_style),
             ]);
             ListItem::new(line).style(Style::default().bg(item_bg))
         }).collect();
@@ -1099,7 +1335,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                 Style::default().add_modifier(Modifier::BOLD)
             })
             .highlight_symbol("");
-        f.render_stateful_widget(sidebar_list, sidebar_layout[1], &mut app.sidebar_state);
+        f.render_stateful_widget(sidebar_list, list_area, &mut app.sidebar_state);
 
         let sidebar_scroll_pos = app.sidebar_state.selected().unwrap_or(0);
         let mut sidebar_scrollbar_state = ScrollbarState::new(filtered_items.len())
@@ -1144,12 +1380,17 @@ fn ui(f: &mut Frame, app: &mut App) {
             ])
             .split(status_chunks[0]);
 
+        let has_git = app.git_info.is_some();
+        let git_btns_width = if has_git { 29 } else { 0 };
+
         let bar_chunks_lower = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
+                Constraint::Length(git_btns_width),
                 Constraint::Min(0),
                 Constraint::Length(25), // Stats
-                Constraint::Length(10), // EXIT
+                Constraint::Length(1),  // Spacer
+                Constraint::Length(6),  // EXIT
             ])
             .split(status_chunks[1]);
             
@@ -1164,7 +1405,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         } else { false };
 
         let is_exit_hovered = if let Some((mx, my)) = app.mouse_pos {
-            bar_chunks_lower[1].contains(Position::new(mx, my))
+            bar_chunks_lower[4].contains(Position::new(mx, my))
         } else { false };
 
         let menu_bg = if is_menu_hovered { Color::Rgb(150, 255, 150) } else { Color::Green };
@@ -1174,6 +1415,38 @@ fn ui(f: &mut Frame, app: &mut App) {
         let menu_span = Span::styled(" ≡ MENU ", Style::default().bg(menu_bg).fg(Color::Black).add_modifier(Modifier::BOLD));
         let copy_span = Span::styled(" COPY ", Style::default().bg(copy_bg).fg(Color::Black).add_modifier(Modifier::BOLD));
         let exit_span = Span::styled(" EXIT ", Style::default().bg(exit_bg).fg(Color::White).add_modifier(Modifier::BOLD));
+
+        let mut is_status_hovered = false;
+        let mut is_diff_hovered = false;
+        let mut is_show_hovered = false;
+        let mut is_history_hovered = false;
+
+        if has_git {
+            let git_btn_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(8), // STATUS
+                    Constraint::Length(6), // DIFF
+                    Constraint::Length(6), // SHOW
+                    Constraint::Length(9), // HISTORY
+                ])
+                .split(bar_chunks_lower[0]);
+            
+            if let Some((mx, my)) = app.mouse_pos {
+                let pos = Position::new(mx, my);
+                is_status_hovered = git_btn_chunks[0].contains(pos);
+                is_diff_hovered = git_btn_chunks[1].contains(pos);
+                is_show_hovered = git_btn_chunks[2].contains(pos);
+                is_history_hovered = git_btn_chunks[3].contains(pos);
+            }
+        }
+
+        let status_bg = if is_status_hovered { Color::Rgb(100, 255, 255) } else { Color::Cyan };
+        let diff_bg = if is_diff_hovered { Color::Rgb(100, 150, 255) } else { Color::Blue };
+        let show_bg = if is_show_hovered { Color::Rgb(200, 150, 255) } else { Color::Magenta };
+        let history_bg = if is_history_hovered { Color::Rgb(255, 200, 150) } else { Color::Rgb(150, 100, 50) }; // Brown/Orange
+
+
         
         f.render_widget(Paragraph::new(menu_span).style(Style::default().bg(Color::Black)), bar_chunks_upper[0]);
         if has_selection {
@@ -1215,11 +1488,33 @@ fn ui(f: &mut Frame, app: &mut App) {
             bar_chunks_upper[3]
         );
 
+        if has_git {
+            let git_btn_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(8), // STATUS
+                    Constraint::Length(6), // DIFF
+                    Constraint::Length(6), // SHOW
+                    Constraint::Length(9), // HISTORY
+                ])
+                .split(bar_chunks_lower[0]);
+            
+            let status_span = Span::styled(" STATUS ", Style::default().bg(status_bg).fg(Color::Black).add_modifier(Modifier::BOLD));
+            let diff_span = Span::styled(" DIFF ", Style::default().bg(diff_bg).fg(Color::White).add_modifier(Modifier::BOLD));
+            let show_span = Span::styled(" SHOW ", Style::default().bg(show_bg).fg(Color::White).add_modifier(Modifier::BOLD));
+            let history_span = Span::styled(" HISTORY ", Style::default().bg(history_bg).fg(Color::White).add_modifier(Modifier::BOLD));
+
+            f.render_widget(Paragraph::new(status_span).style(Style::default().bg(Color::Black)), git_btn_chunks[0]);
+            f.render_widget(Paragraph::new(diff_span).style(Style::default().bg(Color::Black)), git_btn_chunks[1]);
+            f.render_widget(Paragraph::new(show_span).style(Style::default().bg(Color::Black)), git_btn_chunks[2]);
+            f.render_widget(Paragraph::new(history_span).style(Style::default().bg(Color::Black)), git_btn_chunks[3]);
+        }
+
         let git_str = app.git_info.as_deref().unwrap_or("");
         f.render_widget(
-            Paragraph::new(Span::styled(git_str, Style::default().fg(Color::Magenta)))
+            Paragraph::new(Span::styled(format!("  {}", git_str), Style::default().fg(Color::Magenta)))
                 .style(Style::default().bg(Color::Black)), 
-            bar_chunks_lower[0]
+            bar_chunks_lower[1]
         );
 
         let cpu_color = if app.cpu_usage > 80.0 { Color::Red } else { Color::Yellow };
@@ -1233,14 +1528,14 @@ fn ui(f: &mut Frame, app: &mut App) {
             Paragraph::new(Span::styled(cpu_mem_str, Style::default().fg(cpu_color)))
                 .alignment(ratatui::layout::Alignment::Right)
                 .style(Style::default().bg(Color::Black)), 
-            bar_chunks_lower[1]
+            bar_chunks_lower[2]
         );
 
         f.render_widget(
             Paragraph::new(exit_span)
                 .alignment(ratatui::layout::Alignment::Right)
                 .style(Style::default().bg(Color::Black)), 
-            bar_chunks_lower[2]
+            bar_chunks_lower[4]
         );
 
         f.render_widget(Block::default().style(Style::default().bg(Color::Black)), scrollbar_area);
