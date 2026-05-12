@@ -1,3 +1,9 @@
 /target
 /termbookman
 debug.log
+
+# Ignore build artifacts in the patch directory
+patch/**/target/
+
+# Ignore Cargo.lock files within patches (the main workspace lock is sufficient)
+patch/**/Cargo.lock

@@ -1,0 +1,31 @@
+# AI Agent Project Summary: rust-dashboard (termbookman)
+
+## 1. Project Purpose
+A TUI-based terminal dashboard that integrates a live PTY shell, a command sidebar (local + history + gists), system monitoring, and GitHub authentication.
+
+## 2. Technical Architecture
+- **TUI Layer**: Built with `ratatui` and `crossterm`.
+- **Terminal Parser**: Uses a **locally patched `vt100` crate** (`patch/vt100`).
+    - **Crucial Patch**: Adds Alternate Character Set (ACS) support, enabling correct rendering of box-drawing characters in apps like `nvtop`.
+- **PTY Bridge**: Uses `portable-pty` to run `bash`. Input is written to `pty_write`; output is parsed by `vt100` and rendered to the Ratatui buffer in a manual loop (lines ~1480-1550 in `src/main.rs`).
+- **Concurrency**: Uses `mpsc` channels to handle PTY data, UI ticks, and GitHub authentication messages across background threads.
+
+## 3. Authentication & Persistence
+- **GitHub Device Flow**: Implemented in `src/main.rs`. Requests `gist` scope by default.
+- **Personal Access Token (PAT)**: Supported via manual entry in the login modal or via `config.toml`.
+- **Persistence**: Configuration is stored in `~/.config/termbookman/config.toml`. Tokens are automatically serialized back to this file upon successful login or manual entry.
+
+## 4. Key Components
+- **Sidebar**: Toggleable between "Saved Commands" (`commands.txt`) and "History" (`.bash_history`). Supports real-time search.
+- **Gists**: Fetched via GitHub API and appended to the sidebar as `curl ... | bash` commands.
+- **Status Bars**: Configurable via `config.toml`, supporting buttons, system stats, and git info.
+
+## 5. Critical Files
+- `src/main.rs`: Core application logic, UI loop, and event handling.
+- `patch/vt100/`: Custom terminal parser (must be used via `[patch.crates-io]`).
+- `commands.txt`: Seed data for the sidebar.
+- `debug.log`: Application-level debug information (includes raw GitHub responses).
+
+## 6. Known Constraints
+- **ACS Support**: Requires the patched `vt100`. Standard registry versions will fail to render box-drawing characters correctly in many CLI tools.
+- **Wide Characters**: The rendering loop explicitly handles wide character continuations to prevent layout corruption.

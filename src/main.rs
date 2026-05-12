@@ -22,11 +22,189 @@ use sysinfo::System;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use vt100::{Parser, MouseProtocolEncoding, MouseProtocolMode};
 use std::sync::mpsc;
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize, Serialize, Clone, Default)]
+struct Config {
+    #[serde(default)]
+    statusbar: StatusBarConfig,
+    #[serde(default)]
+    auth: AuthConfig,
+}
+
+#[derive(Deserialize, Serialize, Clone, Default)]
+struct AuthConfig {
+    github_client_id: Option<String>,
+    personal_access_token: Option<String>,
+    #[serde(default)]
+    scope: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Default)]
+struct StatusBarConfig {
+    #[serde(default)]
+    upper: Vec<StatusBarItem>,
+    #[serde(default)]
+    lower: Vec<StatusBarItem>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+struct StatusBarItem {
+    #[serde(default)]
+    type_: ItemType,
+    label: Option<String>,
+    action: Option<ActionType>,
+    command: Option<String>,
+    color: Option<String>,
+    hover_color: Option<String>,
+    condition: Option<ConditionType>,
+    width: Option<u16>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ItemType { #[default] Button, Spacer, SystemStats, GitInfo, TimeAndScroll, SelectedCommandInfo }
+
+#[derive(Deserialize, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ActionType { ToggleMenu, CopySelection, SendCommand, Quit, ShowLoginModal, FetchGists }
+
+#[derive(Deserialize, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ConditionType { HasGit, HasSelection }
+
+fn save_config(config: &Config) -> Result<(), Box<dyn Error>> {
+    if let Some(proj_dirs) = directories::ProjectDirs::from("", "", "termbookman") {
+        let config_dir = proj_dirs.config_dir();
+        if !config_dir.exists() {
+            std::fs::create_dir_all(config_dir)?;
+        }
+        let config_file = config_dir.join("config.toml");
+        let content = toml::to_string_pretty(config)?;
+        std::fs::write(config_file, content)?;
+    }
+    Ok(())
+}
+
+fn load_config() -> Config {
+    let default_config = r#"
+[auth]
+scope = "gist"
+personal_access_token = "YOUR_TOKEN_HERE"
+
+[statusbar]
+[[statusbar.upper]]
+label = " ≡ MENU "
+action = "toggle_menu"
+color = "green"
+hover_color = "light_green"
+
+[[statusbar.upper]]
+label = " COPY "
+action = "copy_selection"
+color = "cyan"
+hover_color = "light_cyan"
+condition = "has_selection"
+
+[[statusbar.upper]]
+type_ = "selected_command_info"
+
+[[statusbar.upper]]
+type_ = "time_and_scroll"
+width = 30
+
+[[statusbar.lower]]
+label = " STATUS "
+action = "send_command"
+command = "git status\r"
+color = "cyan"
+hover_color = "light_cyan"
+condition = "has_git"
+
+[[statusbar.lower]]
+label = " DIFF "
+action = "send_command"
+command = "git diff\r"
+color = "blue"
+hover_color = "light_blue"
+condition = "has_git"
+
+[[statusbar.lower]]
+label = " SHOW "
+action = "send_command"
+command = "git show\r"
+color = "magenta"
+hover_color = "light_magenta"
+condition = "has_git"
+
+[[statusbar.lower]]
+label = " HISTORY "
+action = "send_command"
+command = "git log --oneline -n 20\r"
+color = "orange"
+hover_color = "light_orange"
+condition = "has_git"
+
+[[statusbar.lower]]
+type_ = "git_info"
+
+[[statusbar.lower]]
+type_ = "system_stats"
+width = 25
+
+[[statusbar.lower]]
+type_ = "spacer"
+width = 1
+
+[[statusbar.lower]]
+label = " LOGIN "
+action = "show_login_modal"
+color = "magenta"
+hover_color = "light_magenta"
+
+[[statusbar.lower]]
+label = " GISTS "
+action = "fetch_gists"
+color = "yellow"
+hover_color = "light_yellow"
+
+[[statusbar.lower]]
+label = " EXIT "
+action = "quit"
+color = "red"
+hover_color = "light_red"
+    "#;
+    
+    if let Some(proj_dirs) = directories::ProjectDirs::from("", "", "termbookman") {
+        let config_dir = proj_dirs.config_dir();
+        let config_file = config_dir.join("config.toml");
+        
+        if config_file.exists() {
+            if let Ok(content) = std::fs::read_to_string(&config_file) {
+                if let Ok(config) = toml::from_str(&content) {
+                    return config;
+                }
+            }
+        } else {
+            if !config_dir.exists() {
+                let _ = std::fs::create_dir_all(config_dir);
+            }
+            let _ = std::fs::write(&config_file, default_config);
+        }
+    }
+    
+    toml::from_str(default_config).unwrap_or_default()
+}
 
 enum Message {
     Event(Event),
     PtyData,
     Tick,
+    DeviceCodeSuccess(String, String, String), // device_code, user_code, verification_uri
+    AuthSuccess(String), // access_token
+    AuthError(String),
+    FetchGists,
+    GistsFetched(Vec<(String, String, String)>), // (label, info, command)
 }
 
 fn log_debug(msg: &str) {
@@ -66,6 +244,17 @@ struct App {
     history_commands: Vec<String>,
     shell_pid: u32,
     is_pty_busy: bool,
+    config: Config,
+    
+    // Auth State
+    show_login_modal: bool,
+    github_user_code: Option<String>,
+    github_verification_uri: Option<String>,
+    github_device_code: Option<String>,
+    auth_token: Option<String>,
+    login_error: Option<String>,
+    pat_input: String,
+    is_pat_focused: bool,
 }
 
 
@@ -118,6 +307,40 @@ fn load_commands(exe_dir: &std::path::Path) -> (Vec<String>, Vec<String>, Vec<St
     (labels, commands, infos)
 }
 
+fn parse_color(color: &str) -> Color {
+    match color.to_lowercase().as_str() {
+        "black" => Color::Black,
+        "red" => Color::Red,
+        "green" => Color::Green,
+        "yellow" => Color::Yellow,
+        "blue" => Color::Blue,
+        "magenta" => Color::Magenta,
+        "cyan" => Color::Cyan,
+        "gray" | "grey" => Color::Gray,
+        "dark_gray" | "dark_grey" => Color::DarkGray,
+        "light_red" => Color::LightRed,
+        "light_green" => Color::LightGreen,
+        "light_yellow" => Color::LightYellow,
+        "light_blue" => Color::LightBlue,
+        "light_magenta" => Color::LightMagenta,
+        "light_cyan" => Color::LightCyan,
+        "white" => Color::White,
+        "orange" => Color::Rgb(255, 165, 0),
+        "light_orange" => Color::Rgb(255, 200, 150),
+        _ => Color::White,
+    }
+}
+
+impl App {
+    fn is_item_visible(&self, item: &StatusBarItem) -> bool {
+        match &item.condition {
+            Some(ConditionType::HasGit) => self.git_info.is_some(),
+            Some(ConditionType::HasSelection) => self.selection_start.is_some() && self.selection_end.is_some() && !self.is_selecting,
+            None => true,
+        }
+    }
+}
+
 impl App {
     fn new(
         pty_write: Box<dyn Write + Send>, 
@@ -130,6 +353,7 @@ impl App {
     ) -> App {
         let mut state = ListState::default();
         state.select(Some(0));
+        let config = load_config();
         App {
             cpu_usage: 0.0,
             mem_usage: (0, 0),
@@ -161,6 +385,15 @@ impl App {
             history_commands: Vec::new(),
             shell_pid,
             is_pty_busy: false,
+            config: config.clone(),
+            show_login_modal: false,
+            github_user_code: None,
+            github_verification_uri: None,
+            github_device_code: None,
+            auth_token: config.auth.personal_access_token.clone().filter(|t| !t.is_empty() && t != "YOUR_TOKEN_HERE"),
+            login_error: None,
+            pat_input: String::new(),
+            is_pat_focused: false,
         }
     }
 
@@ -490,6 +723,116 @@ fn main() -> Result<(), Box<dyn Error>> {
             Message::Tick => {
                 app.update_stats(&mut sys);
             }
+            Message::DeviceCodeSuccess(device_code, user_code, verification_uri) => {
+                app.github_device_code = Some(device_code.clone());
+                app.github_user_code = Some(user_code);
+                app.github_verification_uri = Some(verification_uri);
+                app.login_error = None;
+
+                let tx = tx.clone();
+                let client_id = app.config.auth.github_client_id.clone().unwrap_or_default();
+                
+                std::thread::spawn(move || {
+                    let url = "https://github.com/login/oauth/access_token";
+                    let client = reqwest::blocking::Client::new();
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        let payload = [
+                            ("client_id", client_id.as_str()),
+                            ("device_code", device_code.as_str()),
+                            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                        ];
+                        
+                        match client.post(url).header("Accept", "application/json").form(&payload).send() {
+                            Ok(res) => {
+                                if let Ok(json) = res.json::<serde_json::Value>() {
+                                    if let Some(token) = json["access_token"].as_str() {
+                                        let _ = tx.send(Message::AuthSuccess(token.to_string()));
+                                        break;
+                                    } else if let Some(error) = json["error"].as_str() {
+                                        if error == "authorization_pending" {
+                                            continue;
+                                        } else if error == "slow_down" {
+                                            std::thread::sleep(std::time::Duration::from_secs(5));
+                                            continue;
+                                        } else {
+                                            let _ = tx.send(Message::AuthError(error.to_string()));
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                let _ = tx.send(Message::AuthError("Network error polling token.".to_string()));
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+            Message::AuthSuccess(token) => {
+                app.auth_token = Some(token.clone());
+                app.config.auth.personal_access_token = Some(token);
+                let _ = save_config(&app.config);
+                app.show_login_modal = false;
+                app.login_error = None;
+            }
+            Message::AuthError(err) => {
+                app.login_error = Some(err);
+            }
+            Message::FetchGists => {
+                if let Some(token) = &app.auth_token {
+                    let tx = tx.clone();
+                    let token = token.clone();
+                    std::thread::spawn(move || {
+                        let url = "https://api.github.com/gists";
+                        let client = reqwest::blocking::Client::builder()
+                            .user_agent("termbookman/0.1.0")
+                            .build().unwrap();
+                        
+                        match client.get(url)
+                            .header("Authorization", format!("token {}", token))
+                            .header("Accept", "application/vnd.github.v3+json")
+                            .send() {
+                            Ok(res) => {
+                                if let Ok(json) = res.json::<serde_json::Value>() {
+                                    if let Some(gists) = json.as_array() {
+                                        let mut fetched = Vec::new();
+                                        for gist in gists {
+                                            let description = gist["description"].as_str().unwrap_or("No description").to_string();
+                                            if let Some(files) = gist["files"].as_object() {
+                                                for (filename, file_info) in files {
+                                                    let raw_url = file_info["raw_url"].as_str().unwrap_or("");
+                                                    if !raw_url.is_empty() {
+                                                        // command to fetch and execute/show gist
+                                                        let cmd = format!("curl -sL {} | bash\r", raw_url);
+                                                        fetched.push((filename.clone(), description.clone(), cmd));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let _ = tx.send(Message::GistsFetched(fetched));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Message::AuthError(format!("Gist fetch error: {}", e)));
+                            }
+                        }
+                    });
+                } else {
+                    app.login_error = Some("Not logged in to GitHub.".to_string());
+                    app.show_login_modal = true;
+                }
+            }
+            Message::GistsFetched(gists) => {
+                for (label, info, cmd) in gists {
+                    app.sidebar_items.push(format!("GIST: {}", label));
+                    app.sidebar_infos.push(info);
+                    app.sidebar_commands.push(cmd);
+                }
+                app.sidebar_state.select(Some(0));
+            }
             Message::Event(event) => {
                 match event {
                     Event::Key(key) => {
@@ -522,6 +865,30 @@ fn main() -> Result<(), Box<dyn Error>> {
                         {
                             let mut p = app.parser.lock().unwrap();
                             p.screen_mut().set_scrollback(0);
+                        }
+
+                        if app.show_login_modal {
+                            if app.is_pat_focused {
+                                match key.code {
+                                    KeyCode::Esc => { app.is_pat_focused = false; }
+                                    KeyCode::Backspace => { app.pat_input.pop(); }
+                                    KeyCode::Char(c) => { app.pat_input.push(c); }
+                                    KeyCode::Enter => {
+                                        if !app.pat_input.trim().is_empty() {
+                                            let token = app.pat_input.trim().to_string();
+                                            app.auth_token = Some(token.clone());
+                                            app.config.auth.personal_access_token = Some(token);
+                                            let _ = save_config(&app.config);
+                                            app.is_pat_focused = false;
+                                            app.login_error = None;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            } else if let KeyCode::Esc = key.code {
+                                app.show_login_modal = false;
+                            }
+                            continue;
                         }
 
                         if app.is_search_focused {
@@ -597,7 +964,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     Event::Mouse(mouse) => {
                         app.last_activity = Instant::now();
                         app.mouse_pos = Some((mouse.column, mouse.row));
-                        handle_click(&mut app, mouse, terminal.size()?);
+                        handle_click(&mut app, mouse, terminal.size()?, &tx);
                     }
                     Event::Resize(_w, _h) => {
                         // Redraw handled by recv
@@ -621,7 +988,43 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect) {
+fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sender<Message>) {
+    if app.show_login_modal {
+        let area = centered_rect_fixed(50, 16, size);
+        if area.contains(Position::new(mouse.column, mouse.row)) {
+            let block = Block::default().borders(Borders::ALL);
+            let inner_area = block.inner(area);
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(1)
+                .constraints([
+                    Constraint::Length(1), // Instruction 1 (Device)
+                    Constraint::Length(2), // Device Flow Info
+                    Constraint::Length(1), // Instruction 2 (PAT)
+                    Constraint::Length(3), // PAT Input Field
+                    Constraint::Min(0),    // Status/Error
+                ])
+                .split(inner_area);
+            
+            if chunks[3].contains(Position::new(mouse.column, mouse.row)) {
+                if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                    app.is_pat_focused = true;
+                }
+                return;
+            }
+        }
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            app.is_pat_focused = false;
+        }
+        // Don't fall through to terminal/sidebar clicks if modal is shown
+        // unless we want to allow closing by clicking outside?
+        // Let's keep it simple for now and just return if modal is shown.
+        if !area.contains(Position::new(mouse.column, mouse.row)) && mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+             app.show_login_modal = false;
+        }
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Fill(1), Constraint::Length(2)])
@@ -728,78 +1131,109 @@ fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect) {
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(chunks[1]);
     
-    let has_selection = app.selection_start.is_some() && app.selection_end.is_some();
-    let copy_width = if has_selection { 6 } else { 0 };
-
-    let bar_chunks_upper = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(8), // MENU
-            Constraint::Length(copy_width), // COPY
-            Constraint::Min(0),
-            Constraint::Length(30),
-        ])
-        .split(status_chunks[0]);
-
-    let has_git = app.git_info.is_some();
-    let git_btns_width = if has_git { 29 } else { 0 };
-
-    let bar_chunks_lower = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(git_btns_width),
-            Constraint::Min(0),
-            Constraint::Length(25), // Stats
-            Constraint::Length(1),  // Spacer
-            Constraint::Length(6),  // EXIT
-        ])
-        .split(status_chunks[1]);
-
     if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-        if bar_chunks_upper[0].contains(Position::new(mouse.column, mouse.row)) {
-            app.show_menu = !app.show_menu;
-            return;
-        }
-        if bar_chunks_upper[1].contains(Position::new(mouse.column, mouse.row)) {
-            app.copy_selection();
-            return;
-        }
+        let bars = vec![
+            (app.config.statusbar.upper.clone(), status_chunks[0]),
+            (app.config.statusbar.lower.clone(), status_chunks[1]),
+        ];
 
-        if has_git {
-            let git_btn_chunks = Layout::default()
+        for (bar_items, bar_chunk) in bars {
+            let mut constraints = Vec::new();
+            let mut visible_items = Vec::new();
+
+            for item in bar_items {
+                if app.is_item_visible(&item) {
+                    let width = if let Some(w) = item.width {
+                        Constraint::Length(w)
+                    } else if item.type_ == ItemType::Spacer || item.type_ == ItemType::GitInfo || item.type_ == ItemType::SelectedCommandInfo {
+                        Constraint::Fill(1)
+                    } else if let Some(label) = &item.label {
+                        Constraint::Length(label.len() as u16)
+                    } else {
+                        Constraint::Min(0)
+                    };
+                    constraints.push(width);
+                    visible_items.push(item);
+                }
+            }
+
+            let chunks = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Length(8), // STATUS
-                    Constraint::Length(6), // DIFF
-                    Constraint::Length(6), // SHOW
-                    Constraint::Length(9), // HISTORY
-                ])
-                .split(bar_chunks_lower[0]);
-            
-            if git_btn_chunks[0].contains(Position::new(mouse.column, mouse.row)) {
-                let _ = app.pty_write.write_all(b"git status\r");
-                let _ = app.pty_write.flush();
-                return;
-            }
-            if git_btn_chunks[1].contains(Position::new(mouse.column, mouse.row)) {
-                let _ = app.pty_write.write_all(b"git diff\r");
-                let _ = app.pty_write.flush();
-                return;
-            }
-            if git_btn_chunks[2].contains(Position::new(mouse.column, mouse.row)) {
-                let _ = app.pty_write.write_all(b"git show\r");
-                let _ = app.pty_write.flush();
-                return;
-            }
-            if git_btn_chunks[3].contains(Position::new(mouse.column, mouse.row)) {
-                let _ = app.pty_write.write_all(b"git log --oneline -n 20\r");
-                let _ = app.pty_write.flush();
-                return;
-            }
-        }
+                .constraints(constraints)
+                .split(bar_chunk);
 
-        if bar_chunks_lower[4].contains(Position::new(mouse.column, mouse.row)) {
-            app.should_quit = true;
+            for (i, item) in visible_items.into_iter().enumerate() {
+                let chunk = chunks[i];
+                if chunk.contains(Position::new(mouse.column, mouse.row)) {
+                    if let Some(action) = item.action {
+                        match action {
+                            ActionType::ToggleMenu => {
+                                app.show_menu = !app.show_menu;
+                            }
+                            ActionType::CopySelection => {
+                                app.copy_selection();
+                            }
+                            ActionType::SendCommand => {
+                                if let Some(cmd) = item.command {
+                                    let _ = app.pty_write.write_all(cmd.as_bytes());
+                                    let _ = app.pty_write.flush();
+                                }
+                            }
+                            ActionType::Quit => {
+                                app.should_quit = true;
+                            }
+                            ActionType::ShowLoginModal => {
+                                app.show_login_modal = !app.show_login_modal;
+                                if app.show_login_modal {
+                                    if let Some(client_id) = &app.config.auth.github_client_id {
+                                        app.login_error = Some("Fetching GitHub code...".to_string());
+                                        let client_id = client_id.clone();
+                                        let scope = app.config.auth.scope.clone();
+                                        let tx = tx.clone();
+                                        std::thread::spawn(move || {
+                                            let url = "https://github.com/login/device/code";
+                                            let client = reqwest::blocking::Client::new();
+                                            let mut params = vec![("client_id", client_id.as_str())];
+                                            if !scope.is_empty() {
+                                                params.push(("scope", scope.as_str()));
+                                            }
+                                            match client.post(url).header("Accept", "application/json").query(&params).send() {
+                                                Ok(res) => {
+                                                    let status = res.status();
+                                                    if let Ok(json) = res.json::<serde_json::Value>() {
+                                                        if let (Some(device), Some(user), Some(uri)) = (json["device_code"].as_str(), json["user_code"].as_str(), json["verification_uri"].as_str()) {
+                                                            let _ = tx.send(Message::DeviceCodeSuccess(device.to_string(), user.to_string(), uri.to_string()));
+                                                            return;
+                                                        }
+                                                        if let Some(error) = json["error"].as_str() {
+                                                            let desc = json["error_description"].as_str().unwrap_or(error);
+                                                            let _ = tx.send(Message::AuthError(format!("GitHub: {}", desc)));
+                                                            log_debug(&format!("GitHub auth error: {} - {}", error, desc));
+                                                            return;
+                                                        }
+                                                        log_debug(&format!("Failed to parse GitHub JSON (status {}): {}", status, json));
+                                                    } else {
+                                                        log_debug(&format!("Failed to parse GitHub response as JSON (status {})", status));
+                                                    }
+                                                    let _ = tx.send(Message::AuthError(format!("Failed to parse device code (Status: {})", status)));
+                                                }
+                                                Err(_) => {
+                                                    let _ = tx.send(Message::AuthError("Network error fetching code.".to_string()));
+                                                }
+                                            }
+                                        });
+                                    } else {
+                                        app.login_error = Some("No github_client_id found in config.".to_string());
+                                    }
+                                }
+                            }
+                            ActionType::FetchGists => {
+                                let _ = tx.send(Message::FetchGists);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     
@@ -1367,176 +1801,122 @@ fn ui(f: &mut Frame, app: &mut App) {
             .constraints([Constraint::Length(1), Constraint::Length(1)])
             .split(chunks[1]);
             
-        let has_selection = app.selection_start.is_some() && app.selection_end.is_some() && !app.is_selecting;
-        let copy_width = if has_selection { 6 } else { 0 };
-
-        let bar_chunks_upper = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(8), // MENU
-                Constraint::Length(copy_width), // COPY
-                Constraint::Min(0),
-                Constraint::Length(30),
-            ])
-            .split(status_chunks[0]);
-
-        let has_git = app.git_info.is_some();
-        let git_btns_width = if has_git { 29 } else { 0 };
-
-        let bar_chunks_lower = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(git_btns_width),
-                Constraint::Min(0),
-                Constraint::Length(25), // Stats
-                Constraint::Length(1),  // Spacer
-                Constraint::Length(6),  // EXIT
-            ])
-            .split(status_chunks[1]);
-            
-        let is_menu_hovered = if let Some((mx, my)) = app.mouse_pos {
-            bar_chunks_upper[0].contains(Position::new(mx, my))
-        } else { false };
-        
-        let is_copy_hovered = if has_selection {
-            if let Some((mx, my)) = app.mouse_pos {
-                bar_chunks_upper[1].contains(Position::new(mx, my))
-            } else { false }
-        } else { false };
-
-        let is_exit_hovered = if let Some((mx, my)) = app.mouse_pos {
-            bar_chunks_lower[4].contains(Position::new(mx, my))
-        } else { false };
-
-        let menu_bg = if is_menu_hovered { Color::Rgb(150, 255, 150) } else { Color::Green };
-        let copy_bg = if is_copy_hovered { Color::Rgb(150, 255, 255) } else { Color::Cyan };
-        let exit_bg = if is_exit_hovered { Color::Rgb(255, 100, 100) } else { Color::Red };
-
-        let menu_span = Span::styled(" ≡ MENU ", Style::default().bg(menu_bg).fg(Color::Black).add_modifier(Modifier::BOLD));
-        let copy_span = Span::styled(" COPY ", Style::default().bg(copy_bg).fg(Color::Black).add_modifier(Modifier::BOLD));
-        let exit_span = Span::styled(" EXIT ", Style::default().bg(exit_bg).fg(Color::White).add_modifier(Modifier::BOLD));
-
-        let mut is_status_hovered = false;
-        let mut is_diff_hovered = false;
-        let mut is_show_hovered = false;
-        let mut is_history_hovered = false;
-
-        if has_git {
-            let git_btn_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Length(8), // STATUS
-                    Constraint::Length(6), // DIFF
-                    Constraint::Length(6), // SHOW
-                    Constraint::Length(9), // HISTORY
-                ])
-                .split(bar_chunks_lower[0]);
-            
-            if let Some((mx, my)) = app.mouse_pos {
-                let pos = Position::new(mx, my);
-                is_status_hovered = git_btn_chunks[0].contains(pos);
-                is_diff_hovered = git_btn_chunks[1].contains(pos);
-                is_show_hovered = git_btn_chunks[2].contains(pos);
-                is_history_hovered = git_btn_chunks[3].contains(pos);
-            }
-        }
-
-        let status_bg = if is_status_hovered { Color::Rgb(100, 255, 255) } else { Color::Cyan };
-        let diff_bg = if is_diff_hovered { Color::Rgb(100, 150, 255) } else { Color::Blue };
-        let show_bg = if is_show_hovered { Color::Rgb(200, 150, 255) } else { Color::Magenta };
-        let history_bg = if is_history_hovered { Color::Rgb(255, 200, 150) } else { Color::Rgb(150, 100, 50) }; // Brown/Orange
-
-
-        
-        f.render_widget(Paragraph::new(menu_span).style(Style::default().bg(Color::Black)), bar_chunks_upper[0]);
-        if has_selection {
-            f.render_widget(Paragraph::new(copy_span).style(Style::default().bg(Color::Black)), bar_chunks_upper[1]);
-        }
-        
-        if let Some(idx) = app.sidebar_state.selected() {
-            if idx < app.sidebar_items.len() {
-                let label = &app.sidebar_items[idx];
-                let info = &app.sidebar_infos[idx];
-                let cmd = &app.sidebar_commands[idx];
-                let status_line = Line::from(vec![
-                    Span::styled(" # ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(format!("{} {} ", label, info), Style::default().fg(Color::White)),
-                    Span::styled(cmd.to_string(), Style::default().fg(Color::DarkGray)),
-                ]);
-                f.render_widget(
-                    Paragraph::new(status_line).style(Style::default().bg(Color::Black)),
-                    bar_chunks_upper[2]
-                );
-            }
-        }
-        
         let (rows, _) = screen.size();
         let scroll_offset = screen.scrollback();
         let history_len = screen.scrollback_len();
-        let total_lines = rows as usize + history_len; 
-        let line_info = format!("{}/{}", scroll_offset, total_lines);
-        
 
-        let stats_line = Line::from(vec![
-            Span::styled(format!("{} | {}", line_info, chrono::Local::now().format("%H:%M:%S")), Style::default().fg(Color::White)),
-        ]);
+        let mut build_and_render_bar = |bar_items: &Vec<StatusBarItem>, bar_chunk: Rect| {
+            let mut constraints = Vec::new();
+            let mut visible_items = Vec::new();
 
-        f.render_widget(
-            Paragraph::new(stats_line)
-                .alignment(ratatui::layout::Alignment::Right)
-                .style(Style::default().bg(Color::Black)), 
-            bar_chunks_upper[3]
-        );
+            for item in bar_items {
+                if app.is_item_visible(item) {
+                    visible_items.push(item);
+                    let width = if let Some(w) = item.width {
+                        Constraint::Length(w)
+                    } else if item.type_ == ItemType::Spacer || item.type_ == ItemType::GitInfo || item.type_ == ItemType::SelectedCommandInfo {
+                        Constraint::Fill(1)
+                    } else if let Some(label) = &item.label {
+                        Constraint::Length(label.len() as u16)
+                    } else {
+                        Constraint::Min(0)
+                    };
+                    constraints.push(width);
+                }
+            }
 
-        if has_git {
-            let git_btn_chunks = Layout::default()
+            let chunks = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Length(8), // STATUS
-                    Constraint::Length(6), // DIFF
-                    Constraint::Length(6), // SHOW
-                    Constraint::Length(9), // HISTORY
-                ])
-                .split(bar_chunks_lower[0]);
-            
-            let status_span = Span::styled(" STATUS ", Style::default().bg(status_bg).fg(Color::Black).add_modifier(Modifier::BOLD));
-            let diff_span = Span::styled(" DIFF ", Style::default().bg(diff_bg).fg(Color::White).add_modifier(Modifier::BOLD));
-            let show_span = Span::styled(" SHOW ", Style::default().bg(show_bg).fg(Color::White).add_modifier(Modifier::BOLD));
-            let history_span = Span::styled(" HISTORY ", Style::default().bg(history_bg).fg(Color::White).add_modifier(Modifier::BOLD));
+                .constraints(constraints)
+                .split(bar_chunk);
 
-            f.render_widget(Paragraph::new(status_span).style(Style::default().bg(Color::Black)), git_btn_chunks[0]);
-            f.render_widget(Paragraph::new(diff_span).style(Style::default().bg(Color::Black)), git_btn_chunks[1]);
-            f.render_widget(Paragraph::new(show_span).style(Style::default().bg(Color::Black)), git_btn_chunks[2]);
-            f.render_widget(Paragraph::new(history_span).style(Style::default().bg(Color::Black)), git_btn_chunks[3]);
-        }
+            for (i, item) in visible_items.iter().enumerate() {
+                let chunk = chunks[i];
+                if chunk.width == 0 { continue; }
 
-        let git_str = app.git_info.as_deref().unwrap_or("");
-        f.render_widget(
-            Paragraph::new(Span::styled(format!("  {}", git_str), Style::default().fg(Color::Magenta)))
-                .style(Style::default().bg(Color::Black)), 
-            bar_chunks_lower[1]
-        );
+                match item.type_ {
+                    ItemType::Button => {
+                        if let Some(label) = &item.label {
+                            let is_hovered = if let Some((mx, my)) = app.mouse_pos {
+                                chunk.contains(Position::new(mx, my))
+                            } else { false };
 
-        let cpu_color = if app.cpu_usage > 80.0 { Color::Red } else { Color::Yellow };
-        let cpu_mem_str = format!("{:.0}% {}/{}GB", 
-            app.cpu_usage.round(), 
-            (app.mem_usage.0 as f64 / 1_073_741_824.0).round() as u64, 
-            (app.mem_usage.1 as f64 / 1_073_741_824.0).round() as u64
-        );
+                            let bg_color_str = if is_hovered {
+                                item.hover_color.as_deref().unwrap_or(item.color.as_deref().unwrap_or("white"))
+                            } else {
+                                item.color.as_deref().unwrap_or("white")
+                            };
+                            
+                            let bg_color = parse_color(bg_color_str);
+                            let fg_color = if bg_color_str == "green" || bg_color_str == "cyan" || bg_color_str.starts_with("light_") { Color::Black } else { Color::White };
+                            
+                            let span = Span::styled(label, Style::default().bg(bg_color).fg(fg_color).add_modifier(Modifier::BOLD));
+                            f.render_widget(Paragraph::new(span).style(Style::default().bg(Color::Black)), chunk);
+                        }
+                    }
+                    ItemType::SystemStats => {
+                        let cpu_color = if app.cpu_usage > 80.0 { Color::Red } else { Color::Yellow };
+                        let cpu_mem_str = format!("{:.0}% {}/{}GB", 
+                            app.cpu_usage.round(), 
+                            (app.mem_usage.0 as f64 / 1_073_741_824.0).round() as u64, 
+                            (app.mem_usage.1 as f64 / 1_073_741_824.0).round() as u64
+                        );
+                        f.render_widget(
+                            Paragraph::new(Span::styled(cpu_mem_str, Style::default().fg(cpu_color)))
+                                .alignment(ratatui::layout::Alignment::Right)
+                                .style(Style::default().bg(Color::Black)), 
+                            chunk
+                        );
+                    }
+                    ItemType::GitInfo => {
+                        let git_str = app.git_info.as_deref().unwrap_or("");
+                        f.render_widget(
+                            Paragraph::new(Span::styled(format!("  {}", git_str), Style::default().fg(Color::Magenta)))
+                                .style(Style::default().bg(Color::Black)), 
+                            chunk
+                        );
+                    }
+                    ItemType::TimeAndScroll => {
+                        let (rows, _) = screen.size();
+                        let scroll_offset = screen.scrollback();
+                        let history_len = screen.scrollback_len();
+                        let total_lines = rows as usize + history_len; 
+                        let line_info = format!("{}/{}", scroll_offset, total_lines);
+                        let stats_line = Line::from(vec![
+                            Span::styled(format!("{} | {}", line_info, chrono::Local::now().format("%H:%M:%S")), Style::default().fg(Color::White)),
+                        ]);
+                        f.render_widget(
+                            Paragraph::new(stats_line)
+                                .alignment(ratatui::layout::Alignment::Right)
+                                .style(Style::default().bg(Color::Black)), 
+                            chunk
+                        );
+                    }
+                    ItemType::SelectedCommandInfo => {
+                        if let Some(idx) = app.sidebar_state.selected() {
+                            if idx < app.sidebar_items.len() {
+                                let label = &app.sidebar_items[idx];
+                                let info = &app.sidebar_infos[idx];
+                                let cmd = &app.sidebar_commands[idx];
+                                let status_line = Line::from(vec![
+                                    Span::styled(" # ", Style::default().fg(Color::DarkGray)),
+                                    Span::styled(format!("{} {} ", label, info), Style::default().fg(Color::White)),
+                                    Span::styled(cmd.to_string(), Style::default().fg(Color::DarkGray)),
+                                ]);
+                                f.render_widget(
+                                    Paragraph::new(status_line).style(Style::default().bg(Color::Black)),
+                                    chunk
+                                );
+                            }
+                        }
+                    }
+                    ItemType::Spacer => {}
+                }
+            }
+        };
 
-        f.render_widget(
-            Paragraph::new(Span::styled(cpu_mem_str, Style::default().fg(cpu_color)))
-                .alignment(ratatui::layout::Alignment::Right)
-                .style(Style::default().bg(Color::Black)), 
-            bar_chunks_lower[2]
-        );
-
-        f.render_widget(
-            Paragraph::new(exit_span)
-                .alignment(ratatui::layout::Alignment::Right)
-                .style(Style::default().bg(Color::Black)), 
-            bar_chunks_lower[4]
-        );
+        build_and_render_bar(&app.config.statusbar.upper, status_chunks[0]);
+        build_and_render_bar(&app.config.statusbar.lower, status_chunks[1]);
 
         f.render_widget(Block::default().style(Style::default().bg(Color::Black)), scrollbar_area);
         let history_len = screen.scrollback_len();
@@ -1587,6 +1967,70 @@ fn ui(f: &mut Frame, app: &mut App) {
         ];
         f.render_widget(List::new(menu_items).block(menu_block).style(Style::default().bg(Color::Black)), area);
     }
+
+    if app.show_login_modal {
+        let area = centered_rect_fixed(50, 16, size);
+        f.render_widget(Clear, area);
+        
+        let block = Block::default()
+            .title(Span::styled(" GitHub Login / PAT ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Magenta))
+            .style(Style::default().bg(Color::Black));
+            
+        f.render_widget(block.clone(), area);
+        let inner_area = block.inner(area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(1), // Instruction 1 (Device)
+                Constraint::Length(2), // Device Flow Info
+                Constraint::Length(1), // Instruction 2 (PAT)
+                Constraint::Length(3), // PAT Input Field
+                Constraint::Min(0),    // Status/Error
+            ])
+            .split(inner_area);
+
+        // --- Device Flow Section ---
+        if let (Some(uri), Some(code)) = (&app.github_verification_uri, &app.github_user_code) {
+            let device_text = format!("1. Open {}   2. Enter: {}", uri, code);
+            f.render_widget(Paragraph::new("DEVICE FLOW:").style(Style::default().fg(Color::DarkGray)), chunks[0]);
+            f.render_widget(Paragraph::new(Span::styled(device_text, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))), chunks[1]);
+        } else {
+            f.render_widget(Paragraph::new("DEVICE FLOW:").style(Style::default().fg(Color::DarkGray)), chunks[0]);
+            f.render_widget(Paragraph::new("Click LOGIN to start device flow...").style(Style::default().fg(Color::DarkGray)), chunks[1]);
+        }
+
+        // --- PAT Section ---
+        f.render_widget(Paragraph::new("OR ENTER PERSONAL ACCESS TOKEN (PAT):").style(Style::default().fg(Color::DarkGray)), chunks[2]);
+        
+        let pat_style = if app.is_pat_focused {
+            Style::default().fg(Color::Yellow).bg(Color::Rgb(20, 20, 20))
+        } else {
+            Style::default().fg(Color::Gray).bg(Color::Black)
+        };
+
+        let pat_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(if app.is_pat_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) });
+
+        let now = Instant::now().duration_since(app.start_time).as_millis();
+        let cursor_char = if app.is_pat_focused && (now / 500) % 2 == 0 { "_" } else { " " };
+        let pat_display = format!(" {}{} ", app.pat_input, cursor_char);
+
+        f.render_widget(Paragraph::new(pat_display).style(pat_style).block(pat_block), chunks[3]);
+
+        // --- Status/Error Section ---
+        if let Some(err) = &app.login_error {
+            f.render_widget(Paragraph::new(Span::styled(err, Style::default().fg(Color::Red))), chunks[4]);
+        } else if app.auth_token.is_some() {
+            f.render_widget(Paragraph::new(Span::styled("✓ Authenticated", Style::default().fg(Color::Green))), chunks[4]);
+        } else {
+            f.render_widget(Paragraph::new(Span::styled("Waiting for input...", Style::default().fg(Color::DarkGray))), chunks[4]);
+        }
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -1597,5 +2041,25 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage((100 - percent_x) / 2), Constraint::Percentage(percent_x), Constraint::Percentage((100 - percent_x) / 2)].as_ref())
+        .split(popup_layout[1])[1]
+}
+
+fn centered_rect_fixed(width: u16, height: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(r.height.saturating_sub(height) / 2),
+            Constraint::Length(height),
+            Constraint::Min(0),
+        ])
+        .split(r);
+        
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(r.width.saturating_sub(width) / 2),
+            Constraint::Length(width),
+            Constraint::Min(0),
+        ])
         .split(popup_layout[1])[1]
 }
