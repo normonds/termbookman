@@ -1,6 +1,7 @@
 /target
 /termbookman
 debug.log
+github.pat.txt
 
 # Ignore build artifacts in the patch directory
 patch/**/target/

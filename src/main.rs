@@ -30,7 +30,11 @@ struct Config {
     statusbar: StatusBarConfig,
     #[serde(default)]
     auth: AuthConfig,
+    #[serde(default = "default_editor")]
+    external_editor: String,
 }
+
+fn default_editor() -> String { "nano".to_string() }
 
 #[derive(Deserialize, Serialize, Clone, Default)]
 struct AuthConfig {
@@ -67,7 +71,7 @@ enum ItemType { #[default] Button, Spacer, SystemStats, GitInfo, TimeAndScroll, 
 
 #[derive(Deserialize, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
-enum ActionType { ToggleMenu, CopySelection, SendCommand, Quit, ShowLoginModal, FetchGists }
+enum ActionType { ToggleMenu, CopySelection, SendCommand, Quit, ShowSettingsModal, FetchGists }
 
 #[derive(Deserialize, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -88,6 +92,8 @@ fn save_config(config: &Config) -> Result<(), Box<dyn Error>> {
 
 fn load_config() -> Config {
     let default_config = r#"
+external_editor = "nano"
+
 [auth]
 scope = "gist"
 personal_access_token = "YOUR_TOKEN_HERE"
@@ -157,8 +163,8 @@ type_ = "spacer"
 width = 1
 
 [[statusbar.lower]]
-label = " LOGIN "
-action = "show_login_modal"
+label = " SETTINGS "
+action = "show_settings_modal"
 color = "magenta"
 hover_color = "light_magenta"
 
@@ -178,21 +184,32 @@ hover_color = "light_red"
     if let Some(proj_dirs) = directories::ProjectDirs::from("", "", "termbookman") {
         let config_dir = proj_dirs.config_dir();
         let config_file = config_dir.join("config.toml");
+        log_debug(&format!("Checking config at: {:?}", config_file));
         
         if config_file.exists() {
             if let Ok(content) = std::fs::read_to_string(&config_file) {
-                if let Ok(config) = toml::from_str(&content) {
-                    return config;
+                match toml::from_str(&content) {
+                    Ok(config) => {
+                        log_debug("Config loaded successfully from file");
+                        return config;
+                    },
+                    Err(e) => {
+                        log_debug(&format!("Config parse error: {}", e));
+                    }
                 }
             }
         } else {
             if !config_dir.exists() {
                 let _ = std::fs::create_dir_all(config_dir);
             }
+            log_debug("Config file not found, writing default");
             let _ = std::fs::write(&config_file, default_config);
         }
+    } else {
+        log_debug("Could not determine project directories");
     }
     
+    log_debug("Falling back to default config");
     toml::from_str(default_config).unwrap_or_default()
 }
 
@@ -204,7 +221,8 @@ enum Message {
     AuthSuccess(String), // access_token
     AuthError(String),
     FetchGists,
-    GistsFetched(Vec<(String, String, String)>), // (label, info, command)
+    GistsFetched(Vec<(String, String, String, Option<std::time::SystemTime>, Option<std::path::PathBuf>, String)>), // (label, info, command, mtime, path, remote_name)
+    GistUploadStatus(String, bool), // (message, is_success)
 }
 
 fn log_debug(msg: &str) {
@@ -212,6 +230,9 @@ fn log_debug(msg: &str) {
         let _ = writeln!(f, "[{}] {}", chrono::Local::now().format("%H:%M:%S"), msg);
     }
 }
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum SidebarMode { Commands, History, Gists }
 
 struct App {
     cpu_usage: f32,
@@ -226,6 +247,8 @@ struct App {
     sidebar_items: Vec<String>,
     sidebar_commands: Vec<String>,
     sidebar_infos: Vec<String>,
+    sidebar_mtimes: Vec<Option<std::time::SystemTime>>,
+    sidebar_paths: Vec<Option<std::path::PathBuf>>,
     sidebar_width: u16,
     is_dragging_sidebar: bool,
     is_dragging_term_scrollbar: bool,
@@ -239,15 +262,21 @@ struct App {
     start_time: Instant,
     search_query: String,
     is_search_focused: bool,
-    show_history: bool,
+    sidebar_mode: SidebarMode,
     history_items: Vec<String>,
     history_commands: Vec<String>,
+    gist_items: Vec<String>,
+    gist_commands: Vec<String>,
+    gist_infos: Vec<String>,
+    gist_mtimes: Vec<Option<std::time::SystemTime>>,
+    gist_paths: Vec<Option<std::path::PathBuf>>,
+    gist_remote_names: Vec<String>,
     shell_pid: u32,
     is_pty_busy: bool,
     config: Config,
     
-    // Auth State
-    show_login_modal: bool,
+    // Settings / Auth State
+    show_settings_modal: bool,
     github_user_code: Option<String>,
     github_verification_uri: Option<String>,
     github_device_code: Option<String>,
@@ -255,57 +284,262 @@ struct App {
     login_error: Option<String>,
     pat_input: String,
     is_pat_focused: bool,
+    editor_input: String,
+    is_editor_focused: bool,
+    loading_gist: bool,
+    last_click_time: Option<Instant>,
+    last_clicked_index: Option<usize>,
+    
+    // Editing Tracking
+    editing_file: Option<(std::path::PathBuf, std::time::SystemTime)>,
+    last_pty_busy: bool,
+    show_upload_confirm: bool,
+    pending_gist_file: Option<std::path::PathBuf>,
 }
 
 
-fn load_commands(exe_dir: &std::path::Path) -> (Vec<String>, Vec<String>, Vec<String>) {
+fn format_time_passed(t: std::time::SystemTime) -> String {
+    let now = std::time::SystemTime::now();
+    let duration = now.duration_since(t).unwrap_or_default();
+    let secs = duration.as_secs();
+    
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+    
+    let mut parts = Vec::new();
+    if days > 0 { parts.push(format!("{}d", days)); }
+    if hours > 0 { parts.push(format!("{}h", hours)); }
+    if mins > 0 || parts.is_empty() { parts.push(format!("{}m", mins)); }
+    
+    parts.join("")
+}
+
+fn parse_script_content(content: &str) -> (String, String) {
+    let mut description = String::new();
+    let mut code_preview = String::new();
+    let mut in_description = false;
+    let mut found_shebang = false;
+    
+    for line in content.lines() {
+        let trimmed = line.trim();
+        
+        if !found_shebang {
+            if trimmed.starts_with("#!") {
+                found_shebang = true;
+                in_description = true;
+            }
+            continue;
+        }
+        
+        if in_description {
+            if trimmed.starts_with('#') {
+                let desc_text = trimmed.trim_start_matches('#').trim();
+                if !desc_text.is_empty() {
+                    if !description.is_empty() {
+                        description.push(' ');
+                    }
+                    description.push_str(desc_text);
+                }
+            } else if trimmed.is_empty() {
+                in_description = false;
+            } else {
+                in_description = false;
+                // First non-comment line after comments
+                if !trimmed.is_empty() && !code_preview.is_empty() {
+                    code_preview.push(' ');
+                }
+                code_preview.push_str(trimmed);
+            }
+        } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if !code_preview.is_empty() {
+                code_preview.push(' ');
+            }
+            code_preview.push_str(trimmed);
+            // Limit preview length
+            if code_preview.len() > 100 {
+                code_preview.truncate(97);
+                code_preview.push_str("...");
+                break;
+            }
+        }
+    }
+    
+    (description, code_preview)
+}
+
+fn parse_lines(content: &str, default_label: &str, label_counts: &mut std::collections::HashMap<String, usize>) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut labels = Vec::new();
     let mut commands = Vec::new();
     let mut infos = Vec::new();
+    let mut last_label_base: Option<String> = None;
+    let mut last_info = String::new();
 
-    let cmd_path = exe_dir.join("commands.txt");
-    let mut label_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-
-    if let Ok(content) = std::fs::read_to_string(cmd_path) {
-        let mut last_label_base: Option<String> = None;
-        let mut last_info = String::new();
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.contains("# termbookman") { continue; }
+        
+        if trimmed.starts_with('#') {
+            let parts: Vec<&str> = trimmed[1..].trim().split_whitespace().collect();
+            if let Some(first) = parts.first() {
+                last_label_base = Some(first.to_string());
+                last_info = parts[1..].join(" ");
             }
-            if trimmed.starts_with('#') {
-                let parts: Vec<&str> = trimmed[1..].trim().split_whitespace().collect();
-                if let Some(first) = parts.first() {
-                    last_label_base = Some(first.to_string());
-                    last_info = parts[1..].join(" ");
-                }
+        } else {
+            let base_name = last_label_base.take().unwrap_or_else(|| {
+                trimmed.split_whitespace().next().unwrap_or(default_label).to_string()
+            });
+            
+            let count = label_counts.entry(base_name.clone()).or_insert(0);
+            *count += 1;
+            
+            let final_label = if *count > 1 {
+                format!("{}{}", base_name, *count)
             } else {
-                let base_name = last_label_base.clone().unwrap_or_else(|| {
-                    trimmed.split_whitespace().next().unwrap_or("cmd").to_string()
-                });
-                
-                let count = label_counts.entry(base_name.clone()).or_insert(0);
-                *count += 1;
-                
-                let final_label = if *count > 1 {
-                    format!("{}{}", base_name, *count)
-                } else {
-                    base_name
-                };
+                base_name
+            };
 
-                labels.push(final_label);
-                commands.push(trimmed.to_string());
-                infos.push(last_info.clone());
-                
-                // Reset for next potential command
-                last_label_base = None;
-                last_info = String::new();
-            }
+            labels.push(final_label);
+            commands.push(trimmed.to_string());
+            infos.push(last_info.clone());
+            last_info = String::new();
         }
     }
     (labels, commands, infos)
 }
+
+fn load_commands(exe_dir: &std::path::Path) -> (Vec<String>, Vec<String>, Vec<String>, Vec<Option<std::time::SystemTime>>, Vec<Option<std::path::PathBuf>>) {
+    let mut labels = Vec::new();
+    let mut commands = Vec::new();
+    let mut infos = Vec::new();
+    let mut mtimes = Vec::new();
+    let mut paths = Vec::new();
+    let mut label_counts = std::collections::HashMap::new();
+
+    // Load local commands
+    let cmd_path = exe_dir.join("commands.txt");
+    if let Ok(content) = std::fs::read_to_string(&cmd_path) {
+        let (l, c, i) = parse_lines(&content, "cmd", &mut label_counts);
+        mtimes.extend(vec![None; l.len()]);
+        paths.extend(vec![Some(cmd_path.clone()); l.len()]);
+        labels.extend(l);
+        commands.extend(c);
+        infos.extend(i);
+    }
+
+    // Load cached Gists
+    if let Some(proj_dirs) = directories::ProjectDirs::from("", "", "termbookman") {
+        let gist_dir = proj_dirs.config_dir().join("gists");
+        if gist_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(gist_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                    
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        let filename = entry.file_name().to_string_lossy().to_string();
+                        if content.contains("# termbookman") {
+                            let (l, c, i) = parse_lines(&content, "cmd", &mut label_counts);
+                            mtimes.extend(vec![mtime; l.len()]);
+                            paths.extend(vec![Some(path.clone()); l.len()]);
+                            labels.extend(l);
+                            commands.extend(c);
+                            infos.extend(i);
+                        } else if content.trim_start().starts_with("#!") {
+                            let name = filename.trim_start_matches("script").trim_start_matches('-').trim().to_string();
+                            let dedup_key = format!("__script__{}", name);
+                            let count = label_counts.entry(dedup_key).or_insert(0);
+                            *count += 1;
+                            let final_label = if *count > 1 { format!("{}{}", name, *count) } else { name.clone() };
+                            let (desc, code_preview) = parse_script_content(&content);
+                            let mut info = "__SCRIPT__".to_string();
+                            if !desc.is_empty() {
+                                info.push(' ');
+                                info.push_str(&desc);
+                            }
+                            if !code_preview.is_empty() {
+                                info.push(' ');
+                                info.push_str(&code_preview);
+                            }
+                            labels.push(final_label.clone());
+                            commands.push(path.to_string_lossy().to_string());
+                            infos.push(info);
+                            mtimes.push(mtime);
+                            paths.push(Some(path.clone()));
+                        } else {
+                            let count = label_counts.entry(filename.clone()).or_insert(0);
+                            *count += 1;
+                            let final_label = if *count > 1 { format!("{}{}", filename, *count) } else { filename.clone() };
+                            labels.push(final_label.clone());
+                            commands.push(final_label);
+                            infos.push(format!("GIST: {}", filename));
+                            mtimes.push(mtime);
+                            paths.push(Some(path.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (labels, commands, infos, mtimes, paths)
+}
+
+fn upload_gist(token: &str, file_path: &std::path::Path, remote_filename: &str) -> Result<(), Box<dyn Error>> {
+    let content = std::fs::read_to_string(file_path)?;
+    
+    // We need to find the Gist ID. We can scan cached gists to find which one this file belongs to.
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("termbookman/0.1.0")
+        .build()?;
+    
+    let url = "https://api.github.com/gists";
+    let res = client.get(url)
+        .header("Authorization", format!("token {}", token))
+        .header("Accept", "application/vnd.github.v3+json")
+        .send()?;
+    
+    if !res.status().is_success() {
+        return Err(format!("Failed to list gists: {}", res.status()).into());
+    }
+    
+    let gists: serde_json::Value = res.json()?;
+    let mut gist_id = None;
+    
+    if let Some(arr) = gists.as_array() {
+        for gist in arr {
+            if let Some(files) = gist["files"].as_object() {
+                if files.contains_key(remote_filename) {
+                    gist_id = gist["id"].as_str().map(|s| s.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    
+    let gist_id = gist_id.ok_or_else(|| format!("Gist containing {} not found on GitHub", remote_filename))?;
+    let update_url = format!("https://api.github.com/gists/{}", gist_id);
+    
+    let mut files = serde_json::Map::new();
+    let mut file_data = serde_json::Map::new();
+    file_data.insert("content".to_string(), serde_json::Value::String(content));
+    files.insert(remote_filename.to_string(), serde_json::Value::Object(file_data));
+    
+    let mut body = serde_json::Map::new();
+    body.insert("files".to_string(), serde_json::Value::Object(files));
+    
+    let res = client.patch(update_url)
+        .header("Authorization", format!("token {}", token))
+        .header("Accept", "application/vnd.github.v3+json")
+        .json(&body)
+        .send()?;
+        
+    if res.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("Failed to update gist: {}", res.status()).into())
+    }
+}
+
 
 fn parse_color(color: &str) -> Color {
     match color.to_lowercase().as_str() {
@@ -339,6 +573,24 @@ impl App {
             None => true,
         }
     }
+
+    fn process_prompt(&self, cmd: &mut String) {
+        while let Some(start) = cmd.find("<prompt") {
+            if let Some(end) = cmd[start..].find(">") {
+                let prompt_str = &cmd[start..start + end + 1];
+                let prompt_name = prompt_str.trim_matches(|c| c == '<' || c == '>' || c == 'p' || c == 'r' || c == 'o' || c == 'm' || c == 'p' || c == 't' || c == ':');
+                
+                let input = if let Ok(output) = std::process::Command::new("bash").arg("-c").arg(format!("read -p '{}: ' val && echo $val", prompt_name)).output() {
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                } else {
+                    String::new()
+                };
+                cmd.replace_range(start..start + end + 1, &input);
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 impl App {
@@ -349,11 +601,14 @@ impl App {
         sidebar_items: Vec<String>,
         sidebar_commands: Vec<String>,
         sidebar_infos: Vec<String>,
+        sidebar_mtimes: Vec<Option<std::time::SystemTime>>,
+        sidebar_paths: Vec<Option<std::path::PathBuf>>,
         shell_pid: u32,
     ) -> App {
         let mut state = ListState::default();
         state.select(Some(0));
         let config = load_config();
+        let auth_token = config.auth.personal_access_token.clone().filter(|t| !t.is_empty() && t != "YOUR_TOKEN_HERE");
         App {
             cpu_usage: 0.0,
             mem_usage: (0, 0),
@@ -362,6 +617,8 @@ impl App {
             sidebar_items,
             sidebar_commands,
             sidebar_infos,
+            sidebar_mtimes,
+            sidebar_paths,
             sidebar_width: 40,
             is_dragging_sidebar: false,
             is_dragging_term_scrollbar: false,
@@ -380,20 +637,35 @@ impl App {
             selection_end: None,
             search_query: String::new(),
             is_search_focused: false,
-            show_history: false,
+            sidebar_mode: SidebarMode::Commands,
             history_items: Vec::new(),
             history_commands: Vec::new(),
+            gist_items: Vec::new(),
+            gist_commands: Vec::new(),
+            gist_infos: Vec::new(),
+            gist_mtimes: Vec::new(),
+            gist_paths: Vec::new(),
+            gist_remote_names: Vec::new(),
             shell_pid,
             is_pty_busy: false,
             config: config.clone(),
-            show_login_modal: false,
+            show_settings_modal: false,
             github_user_code: None,
             github_verification_uri: None,
             github_device_code: None,
-            auth_token: config.auth.personal_access_token.clone().filter(|t| !t.is_empty() && t != "YOUR_TOKEN_HERE"),
+            auth_token: auth_token.clone(),
             login_error: None,
-            pat_input: String::new(),
+            pat_input: auth_token.unwrap_or_default(),
             is_pat_focused: false,
+            editor_input: config.external_editor.clone(),
+            is_editor_focused: false,
+            loading_gist: false,
+            last_click_time: None,
+            last_clicked_index: None,
+            editing_file: None,
+            last_pty_busy: false,
+            show_upload_confirm: false,
+            pending_gist_file: None,
         }
     }
 
@@ -456,6 +728,67 @@ impl App {
                 break;
             }
         }
+
+        // Detect transition from busy to not busy (editor closed)
+        if self.last_pty_busy && !self.is_pty_busy {
+            if let Some((path, old_mtime)) = self.editing_file.take() {
+                if let Ok(metadata) = std::fs::metadata(&path) {
+                    if let Ok(new_mtime) = metadata.modified() {
+                        if new_mtime > old_mtime {
+                            log_debug(&format!("File modified: {:?}", path));
+                            // Check if it's a Gist file
+                            if let Some(proj_dirs) = directories::ProjectDirs::from("", "", "termbookman") {
+                                let gist_dir = proj_dirs.config_dir().join("gists");
+                                if path.starts_with(&gist_dir) {
+                                    self.show_upload_confirm = true;
+                                    self.pending_gist_file = Some(path);
+                                    
+                                    // Reload sidebar items to reflect changes in labels/keywords immediately
+                                    log_debug("Gist modified, reloading sidebar...");
+                                    let exe_path = std::env::current_exe().unwrap_or_default();
+                                    let exe_dir = exe_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+                                    let (l, c, i, m, p) = load_commands(exe_dir);
+                                    self.sidebar_items = l;
+                                    self.sidebar_commands = c;
+                                    self.sidebar_infos = i;
+                                    self.sidebar_mtimes = m;
+                                    self.sidebar_paths = p;
+                                    
+                                    // Also update Gist tab items if we have them and they were loaded from this path
+                                    for idx in 0..self.gist_paths.len() {
+                                        if let Some(gp) = &self.gist_paths[idx] {
+                                            if gp == &self.pending_gist_file.clone().unwrap() {
+                                                if let Ok(content) = std::fs::read_to_string(gp) {
+                                                    if content.trim_start().starts_with("#!") {
+                                                        let (desc, preview) = parse_script_content(&content);
+                                                        let mut info = "__SCRIPT__".to_string();
+                                                        if !desc.is_empty() { info.push(' '); info.push_str(&desc); }
+                                                        if !preview.is_empty() { info.push(' '); info.push_str(&preview); }
+                                                        self.gist_infos[idx] = info;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Local command file (commands.txt) modified, reload
+                                    log_debug("Local commands modified, reloading...");
+                                    let exe_path = std::env::current_exe().unwrap_or_default();
+                                    let exe_dir = exe_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+                                    let (l, c, i, m, p) = load_commands(exe_dir);
+                                    self.sidebar_items = l;
+                                    self.sidebar_commands = c;
+                                    self.sidebar_infos = i;
+                                    self.sidebar_mtimes = m;
+                                    self.sidebar_paths = p;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.last_pty_busy = self.is_pty_busy;
 
         // Only refresh git info every ~2 seconds (40 * 50ms) to save CPU
         static mut GIT_COUNTER: u32 = 0;
@@ -549,44 +882,90 @@ fn main() -> Result<(), Box<dyn Error>> {
     let exe_path = std::env::current_exe()?;
     let exe_dir = exe_path.parent().ok_or("Could not find executable directory")?;
     let args: Vec<String> = std::env::args().collect();
-    let (sidebar_items, sidebar_commands, sidebar_infos) = load_commands(exe_dir);
+    let (labels, sidebar_commands, sidebar_infos, sidebar_mtimes, sidebar_paths) = load_commands(exe_dir);
 
     if args.len() > 1 {
-        let exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
-        let (labels, sidebar_commands, _) = load_commands(&exe_dir);
-        let search_label = args[1].clone();
+        let action = &args[1];
         
-        if let Some(i) = labels.iter().position(|l| l == &search_label) {
-            if let Some(cmd) = sidebar_commands.get(i) {
-                if cmd.contains("<prompt:") {
-                    let mut final_cmd = cmd.clone();
-                    while let Some(start) = final_cmd.find("<prompt:") {
-                        if let Some(end) = final_cmd[start..].find(">") {
-                            let tag = &final_cmd[start + 8..start + end];
-                            let parts: Vec<&str> = tag.split(':').collect();
-                            let label = parts.get(0).unwrap_or(&"Value");
-                            let default = parts.get(1).unwrap_or(&"");
-                            
-                            print!("{}: (Default: {}) ", label, default);
-                            std::io::stdout().flush()?;
-                            
-                            let mut input = String::new();
-                            std::io::stdin().read_line(&mut input)?;
-                            let input = input.trim();
-                            
-                            let val = if input.is_empty() { default.to_string() } else { input.to_string() };
-                            final_cmd.replace_range(start..start + end + 1, &val);
-                        } else {
-                            break;
+        if action == "print" && args.len() > 2 {
+            if args[2] == "script" && args.len() > 3 {
+                // termbookman print script <label>
+                let search_label = &args[3];
+                for (i, label) in labels.iter().enumerate() {
+                    if label == search_label && sidebar_infos[i].starts_with("__SCRIPT__") {
+                        let path = &sidebar_commands[i];
+                        match std::fs::read_to_string(path) {
+                            Ok(content) => print!("{}", content),
+                            Err(e) => eprintln!("Error reading script: {}", e),
                         }
+                        return Ok(());
                     }
-                    println!("\x1b[90mExecuting: {}\x1b[0m", final_cmd);
-                    std::process::Command::new("bash").arg("-c").arg(&final_cmd).status()?;
-                } else {
-                    println!("\x1b[90mExecuting: {}\x1b[0m", cmd);
-                    std::process::Command::new("bash").arg("-c").arg(cmd).status()?;
                 }
-                return Ok(());
+            } else {
+                let search_label = &args[2];
+                if let Some(i) = labels.iter().position(|l| l == search_label) {
+                    if let Some(cmd) = sidebar_commands.get(i) {
+                        println!("{}", cmd);
+                        return Ok(());
+                    }
+                }
+            }
+        } else if action == "script" && args.len() > 2 {
+            // termbookman script <label>
+            let search_label = &args[2];
+            for (i, label) in labels.iter().enumerate() {
+                if label == search_label && sidebar_infos[i].starts_with("__SCRIPT__") {
+                    let cmd = &sidebar_commands[i];
+                    let gist_info = if let Some(mtime) = sidebar_mtimes[i] {
+                        format!(" [gist from local cache, saved {} ago]", format_time_passed(mtime))
+                    } else {
+                        String::new()
+                    };
+                    println!("\x1b[90mExecuting script{}: {}\x1b[0m", gist_info, cmd);
+                    std::process::Command::new("bash").arg(cmd).status()?;
+                    return Ok(());
+                }
+            }
+        } else {
+            let search_label = action;
+            if let Some(i) = labels.iter().position(|l| l == search_label) {
+                if let Some(cmd) = sidebar_commands.get(i) {
+                    let gist_info = if let Some(mtime) = sidebar_mtimes[i] {
+                        format!(" [gist from local cache, saved {} ago]", format_time_passed(mtime))
+                    } else {
+                        String::new()
+                    };
+                    
+                    if cmd.contains("<prompt:") {
+                        let mut final_cmd = cmd.clone();
+                        while let Some(start) = final_cmd.find("<prompt:") {
+                            if let Some(end) = final_cmd[start..].find(">") {
+                                let tag = &final_cmd[start + 8..start + end];
+                                let parts: Vec<&str> = tag.split(':').collect();
+                                let label = parts.get(0).unwrap_or(&"Value");
+                                let default = parts.get(1).unwrap_or(&"");
+                                
+                                print!("{}: (Default: {}) ", label, default);
+                                std::io::stdout().flush()?;
+                                
+                                let mut input = String::new();
+                                std::io::stdin().read_line(&mut input)?;
+                                let input = input.trim();
+                                
+                                let val = if input.is_empty() { default.to_string() } else { input.to_string() };
+                                final_cmd.replace_range(start..start + end + 1, &val);
+                            } else {
+                                break;
+                            }
+                        }
+                        println!("\x1b[90mExecuting{}: {}\x1b[0m", gist_info, final_cmd);
+                        std::process::Command::new("bash").arg("-c").arg(&final_cmd).status()?;
+                    } else {
+                        println!("\x1b[90mExecuting{}: {}\x1b[0m", gist_info, cmd);
+                        std::process::Command::new("bash").arg("-c").arg(cmd).status()?;
+                    }
+                    return Ok(());
+                }
             }
         }
         return Ok(());
@@ -701,7 +1080,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         pixel_height: 0,
     });
 
-    let mut app = App::new(pty_write, master, parser, sidebar_items, sidebar_commands, sidebar_infos, child.process_id().unwrap_or(0));
+    let mut app = App::new(pty_write, master, parser, labels, sidebar_commands, sidebar_infos, sidebar_mtimes, sidebar_paths, child.process_id().unwrap_or(0));
+    
+    if app.auth_token.is_some() {
+        let _ = tx.send(Message::FetchGists);
+    }
     
     let mut sys = System::new_all();
 
@@ -774,13 +1157,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                 app.auth_token = Some(token.clone());
                 app.config.auth.personal_access_token = Some(token);
                 let _ = save_config(&app.config);
-                app.show_login_modal = false;
+                app.show_settings_modal = false;
                 app.login_error = None;
             }
             Message::AuthError(err) => {
                 app.login_error = Some(err);
             }
             Message::FetchGists => {
+                log_debug("Message::FetchGists received");
+                app.loading_gist = true;
                 if let Some(token) = &app.auth_token {
                     let tx = tx.clone();
                     let token = token.clone();
@@ -795,43 +1180,111 @@ fn main() -> Result<(), Box<dyn Error>> {
                             .header("Accept", "application/vnd.github.v3+json")
                             .send() {
                             Ok(res) => {
-                                if let Ok(json) = res.json::<serde_json::Value>() {
-                                    if let Some(gists) = json.as_array() {
-                                        let mut fetched = Vec::new();
-                                        for gist in gists {
-                                            let description = gist["description"].as_str().unwrap_or("No description").to_string();
-                                            if let Some(files) = gist["files"].as_object() {
-                                                for (filename, file_info) in files {
-                                                    let raw_url = file_info["raw_url"].as_str().unwrap_or("");
-                                                    if !raw_url.is_empty() {
-                                                        // command to fetch and execute/show gist
-                                                        let cmd = format!("curl -sL {} | bash\r", raw_url);
-                                                        fetched.push((filename.clone(), description.clone(), cmd));
+                                let status = res.status();
+                                match res.text() {
+                                    Ok(body) => {
+                                        log_debug(&format!("Gist fetch response ({}): {}", status, body));
+                                        if status.is_success() {
+                                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                                                if let Some(gists) = json.as_array() {
+                                                    let mut fetched = Vec::new();
+                                                    let mut label_counts = std::collections::HashMap::new();
+                                                    for gist in gists {
+                                                        let description = gist["description"].as_str().unwrap_or("No description").to_string();
+                                                        if let Some(files) = gist["files"].as_object() {
+                                                            for (filename, file_info) in files {
+                                                                let raw_url = file_info["raw_url"].as_str().unwrap_or("");
+                                                                if !raw_url.is_empty() {
+                                                                    if let Ok(mut resp) = client.get(raw_url).send() {
+                                                                        if let Ok(content) = resp.text() {
+                                                                            let gist_dir = directories::ProjectDirs::from("", "", "termbookman").map(|pd| pd.config_dir().join("gists")).unwrap_or_else(|| std::path::PathBuf::from("gists"));
+                                                                            let _ = std::fs::create_dir_all(&gist_dir);
+                                                                            let safe_filename = filename.replace(' ', "_");
+                                                                            let gist_file = gist_dir.join(&safe_filename);
+                                                                            let _ = std::fs::write(&gist_file, &content);
+
+                                                                            log_debug(&format!("Processing Gist file: {} (saved as {})", filename, safe_filename));
+                                                                            if content.contains("# termbookman") {
+                                                                                let (labels, cmds, infos) = parse_lines(&content, "cmd", &mut label_counts);
+                                                                                for ((label, cmd), info) in labels.into_iter().zip(cmds.into_iter()).zip(infos.into_iter()) {
+                                                                                    fetched.push((label, info, cmd, Some(std::time::SystemTime::now()), Some(gist_file.clone()), filename.clone()));
+                                                                                }
+                                                                            } else if content.trim_start().starts_with("#!") {
+                                                                                log_debug("Detected script gist");
+                                                                                let name = filename.trim_start_matches("script").trim_start_matches('-').trim_start_matches('_').trim().to_string();
+                                                                                let count = label_counts.entry(name.clone()).or_insert(0);
+                                                                                *count += 1;
+                                                                                let final_label = if *count > 1 { format!("{}{}", name, *count) } else { name };
+                                                                                let (desc, code_preview) = parse_script_content(&content);
+                                                                                let mut info = "__SCRIPT__".to_string();
+                                                                                if !desc.is_empty() {
+                                                                                    info.push(' ');
+                                                                                    info.push_str(&desc);
+                                                                                }
+                                                                                if !code_preview.is_empty() {
+                                                                                    info.push(' ');
+                                                                                    info.push_str(&code_preview);
+                                                                                }
+                                                                                fetched.push((final_label.clone(), info, gist_file.to_string_lossy().to_string(), Some(std::time::SystemTime::now()), Some(gist_file.clone()), filename.clone()));
+                                                                            } else {
+                                                                                log_debug("Detected default gist");
+                                                                                fetched.push((filename.clone(), filename.clone(), format!("curl -sL {}", raw_url), Some(std::time::SystemTime::now()), Some(gist_file.clone()), filename.clone()));
+                                                                            }
+                                                                            log_debug(&format!("Current fetched size: {}", fetched.len()));
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
                                                     }
+                                                    let _ = tx.send(Message::GistsFetched(fetched));
                                                 }
                                             }
+                                        } else {
+                                            let _ = tx.send(Message::AuthError(format!("Gist fetch failed ({})", status)));
                                         }
-                                        let _ = tx.send(Message::GistsFetched(fetched));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Message::AuthError(format!("Gist response read error: {}", e)));
                                     }
                                 }
                             }
                             Err(e) => {
-                                let _ = tx.send(Message::AuthError(format!("Gist fetch error: {}", e)));
+                                log_debug(&format!("Gist fetch network error: {}", e));
+                                let _ = tx.send(Message::AuthError(format!("Gist network error: {}", e)));
                             }
                         }
                     });
                 } else {
                     app.login_error = Some("Not logged in to GitHub.".to_string());
-                    app.show_login_modal = true;
+                    app.show_settings_modal = true;
                 }
             }
             Message::GistsFetched(gists) => {
-                for (label, info, cmd) in gists {
-                    app.sidebar_items.push(format!("GIST: {}", label));
-                    app.sidebar_infos.push(info);
-                    app.sidebar_commands.push(cmd);
+                app.loading_gist = false;
+                app.gist_items.clear();
+                app.gist_infos.clear();
+                app.gist_commands.clear();
+                app.gist_mtimes.clear();
+                app.gist_paths.clear();
+                app.gist_remote_names.clear();
+                for (label, info, cmd, mtime, path, remote_name) in gists {
+                    app.gist_items.push(label);
+                    app.gist_infos.push(info);
+                    app.gist_commands.push(cmd);
+                    app.gist_mtimes.push(mtime);
+                    app.gist_paths.push(path);
+                    app.gist_remote_names.push(remote_name);
                 }
+                app.sidebar_mode = SidebarMode::Gists;
                 app.sidebar_state.select(Some(0));
+            }
+            Message::GistUploadStatus(msg, _is_success) => {
+                // Use echo to safely output the message through the shell
+                let escaped = msg.replace("'", "'\"'\"'");
+                let echo_cmd = format!("echo '{}'\r", escaped);
+                let _ = app.pty_write.write_all(echo_cmd.as_bytes());
+                let _ = app.pty_write.flush();
             }
             Message::Event(event) => {
                 match event {
@@ -867,7 +1320,52 @@ fn main() -> Result<(), Box<dyn Error>> {
                             p.screen_mut().set_scrollback(0);
                         }
 
-                        if app.show_login_modal {
+                        if app.show_upload_confirm {
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                    if let (Some(path), Some(token)) = (app.pending_gist_file.take(), app.auth_token.clone()) {
+                                        // Find original remote name
+                                        let mut remote_name = None;
+                                        for (i, p) in app.gist_paths.iter().enumerate() {
+                                            if let Some(p) = p {
+                                                if p == &path {
+                                                    remote_name = Some(app.gist_remote_names[i].clone());
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        
+                                        if let Some(remote_name) = remote_name {
+                                            let tx = tx.clone();
+                                            let display_name = remote_name.clone();
+                                            std::thread::spawn(move || {
+                                                let start_msg = format!("[Uploading Gist: {}]", display_name);
+                                                let _ = tx.send(Message::GistUploadStatus(start_msg, true));
+                                                
+                                                if let Err(e) = upload_gist(&token, &path, &remote_name) {
+                                                    log_debug(&format!("Gist upload error: {}", e));
+                                                    let msg = format!("✗ Gist upload failed: {}", e);
+                                                    let _ = tx.send(Message::GistUploadStatus(msg, false));
+                                                } else {
+                                                    log_debug("Gist uploaded successfully");
+                                                    let msg = format!("✓ Gist updated: {}", display_name);
+                                                    let _ = tx.send(Message::GistUploadStatus(msg, true));
+                                                }
+                                            });
+                                        }
+                                    }
+                                    app.show_upload_confirm = false;
+                                }
+                                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                    app.show_upload_confirm = false;
+                                    app.pending_gist_file = None;
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+
+                        if app.show_settings_modal {
                             if app.is_pat_focused {
                                 match key.code {
                                     KeyCode::Esc => { app.is_pat_focused = false; }
@@ -885,8 +1383,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                     _ => {}
                                 }
+                            } else if app.is_editor_focused {
+                                match key.code {
+                                    KeyCode::Esc => { app.is_editor_focused = false; }
+                                    KeyCode::Backspace => { app.editor_input.pop(); }
+                                    KeyCode::Char(c) => { app.editor_input.push(c); }
+                                    KeyCode::Enter => {
+                                        if !app.editor_input.trim().is_empty() {
+                                            app.config.external_editor = app.editor_input.trim().to_string();
+                                            let _ = save_config(&app.config);
+                                            app.is_editor_focused = false;
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             } else if let KeyCode::Esc = key.code {
-                                app.show_login_modal = false;
+                                app.show_settings_modal = false;
                             }
                             continue;
                         }
@@ -962,6 +1474,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         let _ = app.pty_write.flush();
                     }
                     Event::Mouse(mouse) => {
+                        log_debug("Mouse event received in event loop");
                         app.last_activity = Instant::now();
                         app.mouse_pos = Some((mouse.column, mouse.row));
                         handle_click(&mut app, mouse, terminal.size()?, &tx);
@@ -989,8 +1502,76 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sender<Message>) {
-    if app.show_login_modal {
-        let area = centered_rect_fixed(50, 16, size);
+    log_debug(&format!("Click at ({}, {}). Screen size: {:?}, sidebar_area: {:?}", mouse.column, mouse.row, size, Rect::new(size.width.saturating_sub(app.sidebar_width), 0, app.sidebar_width, size.height)));
+    
+    if app.show_upload_confirm {
+        let area = centered_rect_fixed(50, 10, size);
+        if area.contains(Position::new(mouse.column, mouse.row)) {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                let block = Block::default().borders(Borders::ALL);
+                let inner = block.inner(area);
+                
+                // The text is rendered centered in 'inner'
+                // "[Y] Yes, Upload    [N] No, Keep Local" is at the bottom (line 4 of 6 inside inner)
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1), // filename
+                        Constraint::Length(2), // question
+                        Constraint::Length(1), // spacer
+                        Constraint::Length(1), // choices
+                        Constraint::Min(0),
+                    ])
+                    .split(inner);
+                
+                if chunks[3].contains(Position::new(mouse.column, mouse.row)) {
+                    let choices_chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([
+                            Constraint::Percentage(50),
+                            Constraint::Percentage(50),
+                        ])
+                        .split(chunks[3]);
+                    
+                    if choices_chunks[0].contains(Position::new(mouse.column, mouse.row)) {
+                        // Clicked [Y]
+                        if let (Some(path), Some(token)) = (app.pending_gist_file.take(), app.auth_token.clone()) {
+                            let mut remote_name = None;
+                            for (i, p) in app.gist_paths.iter().enumerate() {
+                                if let Some(p) = p {
+                                    if p == &path {
+                                        remote_name = Some(app.gist_remote_names[i].clone());
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(remote_name) = remote_name {
+                                let tx = tx.clone();
+                                let display_name = remote_name.clone();
+                                std::thread::spawn(move || {
+                                    let _ = tx.send(Message::GistUploadStatus(format!("[Uploading Gist: {}]", display_name), true));
+                                    if let Err(e) = upload_gist(&token, &path, &remote_name) {
+                                        let _ = tx.send(Message::GistUploadStatus(format!("✗ Gist upload failed: {}", e), false));
+                                    } else {
+                                        let _ = tx.send(Message::GistUploadStatus(format!("✓ Gist updated: {}", display_name), true));
+                                    }
+                                });
+                            }
+                        }
+                        app.show_upload_confirm = false;
+                    } else if choices_chunks[1].contains(Position::new(mouse.column, mouse.row)) {
+                        // Clicked [N]
+                        app.show_upload_confirm = false;
+                        app.pending_gist_file = None;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    if app.show_settings_modal {
+        let area = centered_rect_fixed(50, 20, size);
         if area.contains(Position::new(mouse.column, mouse.row)) {
             let block = Block::default().borders(Borders::ALL);
             let inner_area = block.inner(area);
@@ -998,29 +1579,37 @@ fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sender<
                 .direction(Direction::Vertical)
                 .margin(1)
                 .constraints([
-                    Constraint::Length(1), // Instruction 1 (Device)
-                    Constraint::Length(2), // Device Flow Info
-                    Constraint::Length(1), // Instruction 2 (PAT)
-                    Constraint::Length(3), // PAT Input Field
-                    Constraint::Min(0),    // Status/Error
+                    Constraint::Length(1), // Header
+                    Constraint::Length(2), // Device Flow
+                    Constraint::Length(1), // PAT Header
+                    Constraint::Length(3), // PAT Input
+                    Constraint::Length(1), // Editor Header
+                    Constraint::Length(3), // Editor Input
+                    Constraint::Min(0),    // Status
                 ])
                 .split(inner_area);
             
             if chunks[3].contains(Position::new(mouse.column, mouse.row)) {
                 if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
                     app.is_pat_focused = true;
+                    app.is_editor_focused = false;
+                }
+                return;
+            }
+            if chunks[5].contains(Position::new(mouse.column, mouse.row)) {
+                if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                    app.is_editor_focused = true;
+                    app.is_pat_focused = false;
                 }
                 return;
             }
         }
         if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
             app.is_pat_focused = false;
-        }
-        // Don't fall through to terminal/sidebar clicks if modal is shown
-        // unless we want to allow closing by clicking outside?
-        // Let's keep it simple for now and just return if modal is shown.
-        if !area.contains(Position::new(mouse.column, mouse.row)) && mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-             app.show_login_modal = false;
+            app.is_editor_focused = false;
+            if !area.contains(Position::new(mouse.column, mouse.row)) {
+                app.show_settings_modal = false;
+            }
         }
         return;
     }
@@ -1182,10 +1771,13 @@ fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sender<
                             ActionType::Quit => {
                                 app.should_quit = true;
                             }
-                            ActionType::ShowLoginModal => {
-                                app.show_login_modal = !app.show_login_modal;
-                                if app.show_login_modal {
-                                    if let Some(client_id) = &app.config.auth.github_client_id {
+                            ActionType::ShowSettingsModal => {
+                                app.show_settings_modal = !app.show_settings_modal;
+                                if app.show_settings_modal {
+                                    app.editor_input = app.config.external_editor.clone();
+                                    if let Some(token) = &app.auth_token {
+                                        app.pat_input = token.clone();
+                                    } else if let Some(client_id) = &app.config.auth.github_client_id {
                                         app.login_error = Some("Fetching GitHub code...".to_string());
                                         let client_id = client_id.clone();
                                         let scope = app.config.auth.scope.clone();
@@ -1244,11 +1836,31 @@ fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sender<
     };
     let is_sidebar_locked = is_app_active || app.is_pty_busy;
 
-    let history_toggle_area = Rect::new(sidebar_area.x, sidebar_area.y, sidebar_area.width, 1);
+    let tabs_area = Rect::new(sidebar_area.x, sidebar_area.y, sidebar_area.width, 1);
     let search_area = Rect::new(sidebar_area.x, sidebar_area.y + 1, sidebar_area.width, 1);
     let list_area = Rect::new(sidebar_area.x, sidebar_area.y + 2, sidebar_area.width, sidebar_area.height.saturating_sub(2));
 
     if is_sidebar_locked {
+        return;
+    }
+
+    if tabs_area.contains(Position::new(mouse.column, mouse.row)) {
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            let tabs_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Ratio(1, 3), Constraint::Ratio(1, 3), Constraint::Ratio(1, 3)])
+                .split(tabs_area);
+            
+            if tabs_chunks[0].contains(Position::new(mouse.column, mouse.row)) {
+                app.sidebar_mode = SidebarMode::Commands;
+            } else if tabs_chunks[1].contains(Position::new(mouse.column, mouse.row)) {
+                app.sidebar_mode = SidebarMode::History;
+                app.refresh_history();
+            } else if tabs_chunks[2].contains(Position::new(mouse.column, mouse.row)) {
+                app.sidebar_mode = SidebarMode::Gists;
+            }
+            app.sidebar_state.select(Some(0));
+        }
         return;
     }
 
@@ -1260,29 +1872,22 @@ fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sender<
     } else if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
         app.is_search_focused = false;
     }
-
-    // Toggle History View
-    if history_toggle_area.contains(Position::new(mouse.column, mouse.row)) {
-        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-            app.show_history = !app.show_history;
-            if app.show_history {
-                app.refresh_history();
-            }
-            app.sidebar_state.select(Some(0));
-        }
-        return;
-    }
-
     if list_area.contains(Position::new(mouse.column, mouse.row)) && !is_app_active {
-        let items = if app.show_history {
-            &app.history_items
-        } else {
-            &app.sidebar_items
+        let (items, infos, commands) = match app.sidebar_mode {
+            SidebarMode::Commands => (&app.sidebar_items, Some(&app.sidebar_infos), &app.sidebar_commands),
+            SidebarMode::History => (&app.history_items, None, &app.history_commands),
+            SidebarMode::Gists => (&app.gist_items, Some(&app.gist_infos), &app.gist_commands),
         };
 
         let filtered: Vec<(usize, &String)> = items.iter().enumerate()
-            .filter(|(_, label)| {
-                label.to_lowercase().contains(&app.search_query.to_lowercase())
+            .filter(|(idx, label)| {
+                let matches_label = label.to_lowercase().contains(&app.search_query.to_lowercase());
+                let matches_info = if let Some(infos) = infos {
+                    infos[*idx].to_lowercase().contains(&app.search_query.to_lowercase())
+                } else {
+                    false
+                };
+                matches_label || matches_info
             })
             .collect();
 
@@ -1305,34 +1910,99 @@ fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sender<
                 let index = (sidebar_y as usize).saturating_add(offset);
 
                 if index < filtered.len() {
-                    app.sidebar_state.select(Some(index));
-                    
-                    let sidebar_x = mouse.column.saturating_sub(list_area.x);
-                    if sidebar_x <= 1 {
-                        // Clicked the indicator part: RUN command
-                        let (original_index, _) = filtered[index];
-                        if app.show_history {
-                            let cmd_str = &app.history_commands[original_index];
-                            let _ = app.pty_write.write_all(cmd_str.as_bytes());
-                            let _ = app.pty_write.write_all(b"\r");
-                        } else {
-                            let label = &app.sidebar_items[original_index];
-                            let exe = std::env::current_exe().unwrap_or_default();
-                            let cmd = format!("{} {}\r", exe.display(), label);
-                            let _ = app.pty_write.write_all(cmd.as_bytes());
+                    let (original_index, label) = filtered[index];
+                    let now = Instant::now();
+                    let is_double_click = if let (Some(last_time), Some(last_idx)) = (app.last_click_time, app.last_clicked_index) {
+                        now.duration_since(last_time) < Duration::from_millis(300) && last_idx == index
+                    } else { false };
+
+                    if is_double_click {
+                        app.last_click_time = None;
+                        app.last_clicked_index = None;
+                        
+                        let (path, cmd_str) = match app.sidebar_mode {
+                            SidebarMode::Commands => {
+                                let p = &app.sidebar_paths[original_index];
+                                (p.clone(), p.as_ref().map(|path| {
+                                    let p_str = path.to_string_lossy().replace("'", "'\\''");
+                                    format!("{} '{}'\r", app.config.external_editor, p_str)
+                                }).unwrap_or_default())
+                            },
+                            SidebarMode::Gists => {
+                                let p = &app.gist_paths[original_index];
+                                (p.clone(), p.as_ref().map(|path| {
+                                    let p_str = path.to_string_lossy().replace("'", "'\\''");
+                                    format!("{} '{}'\r", app.config.external_editor, p_str)
+                                }).unwrap_or_default())
+                            },
+                            SidebarMode::History => (None, String::new()),
+                        };
+                        
+                        if let (Some(p), _) = (&path, &cmd_str) {
+                            if let Ok(metadata) = std::fs::metadata(p) {
+                                if let Ok(mtime) = metadata.modified() {
+                                    app.editing_file = Some((p.clone(), mtime));
+                                }
+                            }
                         }
+
+                        if !cmd_str.is_empty() {
+                            let _ = app.pty_write.write_all(cmd_str.as_bytes());
+                            let _ = app.pty_write.flush();
+                        }
+                    } else {
+                        app.sidebar_state.select(Some(index));
+                        app.last_click_time = Some(now);
+                        app.last_clicked_index = Some(index);
+                        
+                        let sidebar_x = mouse.column.saturating_sub(list_area.x);
+                        if sidebar_x <= 1 {
+                            if label.starts_with("GIST: ") && app.sidebar_mode == SidebarMode::Gists {
+                                 let _ = tx.send(Message::FetchGists);
+                            } else {
+                        let (items, infos, _) = match app.sidebar_mode {
+                            SidebarMode::Commands => (&app.sidebar_items, Some(&app.sidebar_infos), &app.sidebar_commands),
+                            SidebarMode::History => (&app.history_items, None, &app.history_commands),
+                            SidebarMode::Gists => (&app.gist_items, Some(&app.gist_infos), &app.gist_commands),
+                        };
+                        let is_script = infos.map(|inf| inf[original_index].starts_with("__SCRIPT__")).unwrap_or(false);
+                        let cmd_str = match app.sidebar_mode {
+                            SidebarMode::History => format!("{}\r", app.history_commands[original_index]),
+                            SidebarMode::Gists | SidebarMode::Commands => {
+                                let label = &items[original_index];
+                                let exe = std::env::current_exe().unwrap_or_default();
+                                if is_script {
+                                    format!("{} script {}\r", exe.display(), label)
+                                } else {
+                                    format!("{} {}\r", exe.display(), label)
+                                }
+                            }
+                        };
+                        let _ = app.pty_write.write_all(cmd_str.as_bytes());
                         let _ = app.pty_write.flush();
+                            }
+                        }
                     }
                 }
             }
             _ => {}
         }
     } else if sidebar_scrollbar_area.contains(Position::new(mouse.column, mouse.row)) || app.is_dragging_sidebar_scrollbar {
-        let filtered: Vec<(usize, &String)> = app.sidebar_items.iter().enumerate()
-            .filter(|(i, label)| {
-                let info = &app.sidebar_infos[*i];
-                label.to_lowercase().contains(&app.search_query.to_lowercase()) ||
-                info.to_lowercase().contains(&app.search_query.to_lowercase())
+        let (items, infos, _) = match app.sidebar_mode {
+            SidebarMode::Commands => (&app.sidebar_items, Some(&app.sidebar_infos), &app.sidebar_commands),
+            SidebarMode::History => (&app.history_items, None, &app.history_commands),
+            SidebarMode::Gists => (&app.gist_items, Some(&app.gist_infos), &app.gist_commands),
+        };
+
+        let filtered: Vec<(usize, &String)> = items.iter().enumerate()
+            .filter(|(idx, label)| {
+                let matches_label = label.to_lowercase().contains(&app.search_query.to_lowercase());
+                let matches_info = if let Some(infos) = infos {
+                    infos[*idx].to_lowercase().contains(&app.search_query.to_lowercase())
+                } else {
+                    false
+                };
+                matches_label || matches_info
             })
             .collect();
 
@@ -1609,34 +2279,63 @@ fn ui(f: &mut Frame, app: &mut App) {
         let sidebar_layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // HISTORY Toggle
+                Constraint::Length(1), // Tabs
                 Constraint::Length(1), // Search Bar
                 Constraint::Min(0)     // List
             ])
             .split(sidebar_area);
-        let history_toggle_area = sidebar_layout[0];
+        let tabs_area = sidebar_layout[0];
         let search_area = sidebar_layout[1];
         let list_area = sidebar_layout[2];
         
-        let is_history_btn_hovered = if let Some((mx, my)) = app.mouse_pos {
-            history_toggle_area.contains(Position::new(mx, my))
-        } else { false };
-
-        let (hist_text, hist_color) = if is_sidebar_locked {
-            ("  SIDEBAR DISABLED  ", Color::DarkGray)
-        } else if app.show_history {
-            ("  HISTORY VIEW  ", Color::Rgb(255, 180, 100))
+        static mut LOGGED_LAYOUT: bool = false;
+        unsafe {
+            if !LOGGED_LAYOUT {
+                log_debug(&format!("Sidebar: {:?}, Tabs: {:?}, List: {:?}", sidebar_area, tabs_area, list_area));
+                LOGGED_LAYOUT = true;
+            }
+        }
+        
+        if is_sidebar_locked {
+             f.render_widget(
+                Paragraph::new(Span::styled("  SIDEBAR DISABLED  ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)))
+                    .style(Style::default().bg(Color::Black))
+                    .alignment(ratatui::layout::Alignment::Center),
+                tabs_area
+            );
         } else {
-            ("  SAVED COMMANDS  ", Color::Rgb(150, 255, 150))
-        };
+            let tabs_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Ratio(1, 3), Constraint::Ratio(1, 3), Constraint::Ratio(1, 3)])
+                .split(tabs_area);
+            
+            let modes = [
+                (SidebarMode::Commands, " COMMANDS ", Color::Green),
+                (SidebarMode::History, " HISTORY ", Color::Rgb(255, 180, 100)),
+                (SidebarMode::Gists, " GISTS ", Color::Yellow),
+            ];
 
-        let hist_btn_bg = if is_history_btn_hovered { Color::Rgb(50, 50, 50) } else { Color::Black };
-        f.render_widget(
-            Paragraph::new(Span::styled(hist_text, Style::default().fg(hist_color).add_modifier(Modifier::BOLD)))
-                .style(Style::default().bg(hist_btn_bg))
-                .alignment(ratatui::layout::Alignment::Center),
-            history_toggle_area
-        );
+            for (i, (mode, label, color)) in modes.iter().enumerate() {
+                let is_active = app.sidebar_mode == *mode;
+                let is_hovered = if let Some((mx, my)) = app.mouse_pos {
+                    tabs_chunks[i].contains(Position::new(mx, my))
+                } else { false };
+
+                let style = if is_active {
+                    Style::default().fg(Color::Black).bg(*color).add_modifier(Modifier::BOLD)
+                } else if is_hovered {
+                    Style::default().fg(*color).bg(Color::Rgb(50, 50, 50))
+                } else {
+                    Style::default().fg(*color).bg(Color::Black)
+                };
+
+                f.render_widget(
+                    Paragraph::new(Span::styled(*label, style))
+                        .alignment(ratatui::layout::Alignment::Center),
+                    tabs_chunks[i]
+                );
+            }
+        }
         
         let search_style = if is_sidebar_locked {
             Style::default().fg(Color::DarkGray).bg(Color::Black)
@@ -1649,35 +2348,43 @@ fn ui(f: &mut Frame, app: &mut App) {
         let now = Instant::now().duration_since(app.start_time).as_millis();
         let cursor_char = if app.is_search_focused && (now / 500) % 2 == 0 { "_" } else { " " };
         
+        let (items, infos, commands) = match app.sidebar_mode {
+            SidebarMode::Commands => (&app.sidebar_items, Some(&app.sidebar_infos), &app.sidebar_commands),
+            SidebarMode::History => (&app.history_items, None, &app.history_commands),
+            SidebarMode::Gists => (&app.gist_items, Some(&app.gist_infos), &app.gist_commands),
+        };
+
         let search_text = if app.search_query.is_empty() && !app.is_search_focused {
-            format!(" Search {} commands .. ", app.sidebar_items.len())
+            format!(" Search {} items .. ", items.len())
         } else {
             format!(" {}{} ", app.search_query, cursor_char)
         };
         f.render_widget(Paragraph::new(search_text).style(search_style), search_area);
 
-        let (items, infos) = if app.show_history {
-            (&app.history_items, None)
-        } else {
-            (&app.sidebar_items, Some(&app.sidebar_infos))
-        };
-
         let filtered_items: Vec<(usize, &String)> = items.iter().enumerate()
-            .filter(|(_, label)| {
-                label.to_lowercase().contains(&app.search_query.to_lowercase())
+            .filter(|(idx, label)| {
+                let matches_label = label.to_lowercase().contains(&app.search_query.to_lowercase());
+                let matches_info = if let Some(infos) = infos {
+                    infos[*idx].to_lowercase().contains(&app.search_query.to_lowercase())
+                } else {
+                    false
+                };
+                matches_label || matches_info
             })
             .collect();
 
         let sidebar_list_items: Vec<ListItem> = filtered_items.iter().enumerate().map(|(idx, (i, item))| {
-            let color = if app.show_history { 
-                Color::Rgb(200, 200, 200) 
-            } else {
-                if app.sidebar_commands[*i].contains("<prompt") {
-                    Color::Green
-                } else if app.sidebar_commands[*i].contains("sudo") || app.sidebar_infos[*i].to_lowercase().contains("sudo") {
-                    Color::Red
-                } else {
-                    Color::White
+            let color = match app.sidebar_mode {
+                SidebarMode::History => Color::Rgb(200, 200, 200),
+                SidebarMode::Gists => Color::Yellow,
+                SidebarMode::Commands => {
+                    if commands[*i].contains("<prompt") {
+                        Color::Green
+                    } else if commands[*i].contains("sudo") || (infos.is_some() && infos.unwrap()[*i].to_lowercase().contains("sudo")) {
+                        Color::Red
+                    } else {
+                        Color::White
+                    }
                 }
             };
 
@@ -1723,7 +2430,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             let (info, is_fallback) = if let Some(infos) = infos {
                 let info_text = &infos[*i];
                 if info_text.trim().is_empty() || info_text.len() < 3 {
-                    (format!(" {}", app.sidebar_commands[*i]), true)
+                    (format!(" {}", commands[*i]), true)
                 } else {
                     (format!(" {}", info_text), false)
                 }
@@ -1731,11 +2438,44 @@ fn ui(f: &mut Frame, app: &mut App) {
                 (String::new(), false)
             };
 
-            let label_text = item;
+            let label_text = if app.sidebar_mode == SidebarMode::Gists && app.loading_gist && idx == 0 {
+                let now = Instant::now().duration_since(app.start_time).as_millis();
+                let spinner = ["|", "/", "-", "\\"][(now / 150 % 4) as usize];
+                format!("{} LOADING ...", spinner)
+            } else {
+                item.to_string()
+            };
+
+            // Detect script items via __SCRIPT__ tag in info field
+            let is_script = if let Some(infos) = infos {
+                infos[*i].starts_with("__SCRIPT__")
+            } else {
+                false
+            };
+
+            // Strip __SCRIPT__ prefix from label if present (gists tab)
+            let label_text = if label_text.starts_with("__SCRIPT__") {
+                label_text[10..].to_string()
+            } else {
+                label_text
+            };
+
+            // Strip __SCRIPT__ from info display text
+            let info = if info.trim_start().starts_with("__SCRIPT__") {
+                let s = info.replacen("__SCRIPT__", "", 1);
+                if s.starts_with("  ") {
+                    s[1..].to_string()
+                } else {
+                    s
+                }
+            } else {
+                info
+            };
+
             let mut command_text = String::new();
             let mut hide_info = false;
-            if label_text.len() < 20 && !app.show_history {
-                command_text = format!(" {}", app.sidebar_commands[*i]);
+            if label_text.len() < 20 && app.sidebar_mode != SidebarMode::History {
+                command_text = format!(" {}", commands[*i]);
                 if is_fallback {
                     hide_info = true;
                 }
@@ -1750,11 +2490,13 @@ fn ui(f: &mut Frame, app: &mut App) {
             };
 
             let command_style = Style::default().fg(Color::Rgb(50, 50, 50)).bg(item_bg);
+            let script_badge_style = Style::default().fg(Color::Rgb(80, 80, 80)).bg(item_bg);
 
             let line = Line::from(vec![
                 Span::styled(" ", Style::default().bg(item_bg)),
                 Span::styled(symbol, indicator_style),
-                Span::styled(label_text.as_str(), style),
+                Span::styled(label_text, style),
+                if is_script { Span::styled(" SCRIPT", script_badge_style) } else { Span::raw("") },
                 if hide_info { Span::raw("") } else { Span::styled(info, info_style) },
                 Span::styled(command_text, command_style),
             ]);
@@ -1968,12 +2710,12 @@ fn ui(f: &mut Frame, app: &mut App) {
         f.render_widget(List::new(menu_items).block(menu_block).style(Style::default().bg(Color::Black)), area);
     }
 
-    if app.show_login_modal {
-        let area = centered_rect_fixed(50, 16, size);
+    if app.show_settings_modal {
+        let area = centered_rect_fixed(50, 20, size);
         f.render_widget(Clear, area);
         
         let block = Block::default()
-            .title(Span::styled(" GitHub Login / PAT ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)))
+            .title(Span::styled(" Settings & GitHub Auth ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Magenta))
             .style(Style::default().bg(Color::Black));
@@ -1985,26 +2727,28 @@ fn ui(f: &mut Frame, app: &mut App) {
             .direction(Direction::Vertical)
             .margin(1)
             .constraints([
-                Constraint::Length(1), // Instruction 1 (Device)
-                Constraint::Length(2), // Device Flow Info
-                Constraint::Length(1), // Instruction 2 (PAT)
-                Constraint::Length(3), // PAT Input Field
-                Constraint::Min(0),    // Status/Error
+                Constraint::Length(1), // Header
+                Constraint::Length(2), // Device Flow
+                Constraint::Length(1), // PAT Header
+                Constraint::Length(3), // PAT Input
+                Constraint::Length(1), // Editor Header
+                Constraint::Length(3), // Editor Input
+                Constraint::Min(0),    // Status
             ])
             .split(inner_area);
 
         // --- Device Flow Section ---
         if let (Some(uri), Some(code)) = (&app.github_verification_uri, &app.github_user_code) {
             let device_text = format!("1. Open {}   2. Enter: {}", uri, code);
-            f.render_widget(Paragraph::new("DEVICE FLOW:").style(Style::default().fg(Color::DarkGray)), chunks[0]);
+            f.render_widget(Paragraph::new("GITHUB DEVICE FLOW:").style(Style::default().fg(Color::DarkGray)), chunks[0]);
             f.render_widget(Paragraph::new(Span::styled(device_text, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))), chunks[1]);
         } else {
-            f.render_widget(Paragraph::new("DEVICE FLOW:").style(Style::default().fg(Color::DarkGray)), chunks[0]);
-            f.render_widget(Paragraph::new("Click LOGIN to start device flow...").style(Style::default().fg(Color::DarkGray)), chunks[1]);
+            f.render_widget(Paragraph::new("GITHUB DEVICE FLOW:").style(Style::default().fg(Color::DarkGray)), chunks[0]);
+            f.render_widget(Paragraph::new("Enter the code on GitHub to authenticate...").style(Style::default().fg(Color::DarkGray)), chunks[1]);
         }
 
         // --- PAT Section ---
-        f.render_widget(Paragraph::new("OR ENTER PERSONAL ACCESS TOKEN (PAT):").style(Style::default().fg(Color::DarkGray)), chunks[2]);
+        f.render_widget(Paragraph::new("GITHUB PERSONAL ACCESS TOKEN (PAT):").style(Style::default().fg(Color::DarkGray)), chunks[2]);
         
         let pat_style = if app.is_pat_focused {
             Style::default().fg(Color::Yellow).bg(Color::Rgb(20, 20, 20))
@@ -2017,19 +2761,91 @@ fn ui(f: &mut Frame, app: &mut App) {
             .border_style(if app.is_pat_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) });
 
         let now = Instant::now().duration_since(app.start_time).as_millis();
-        let cursor_char = if app.is_pat_focused && (now / 500) % 2 == 0 { "_" } else { " " };
-        let pat_display = format!(" {}{} ", app.pat_input, cursor_char);
-
+        let pat_cursor = if app.is_pat_focused && (now / 500) % 2 == 0 { "_" } else { " " };
+        let pat_display = format!(" {}{} ", app.pat_input, pat_cursor);
         f.render_widget(Paragraph::new(pat_display).style(pat_style).block(pat_block), chunks[3]);
+
+        // --- Editor Section ---
+        f.render_widget(Paragraph::new("EXTERNAL EDITOR:").style(Style::default().fg(Color::DarkGray)), chunks[4]);
+        
+        let editor_style = if app.is_editor_focused {
+            Style::default().fg(Color::Yellow).bg(Color::Rgb(20, 20, 20))
+        } else {
+            Style::default().fg(Color::Gray).bg(Color::Black)
+        };
+
+        let editor_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(if app.is_editor_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) });
+
+        let editor_cursor = if app.is_editor_focused && (now / 500) % 2 == 0 { "_" } else { " " };
+        let editor_display = format!(" {}{} ", app.editor_input, editor_cursor);
+        f.render_widget(Paragraph::new(editor_display).style(editor_style).block(editor_block), chunks[5]);
 
         // --- Status/Error Section ---
         if let Some(err) = &app.login_error {
-            f.render_widget(Paragraph::new(Span::styled(err, Style::default().fg(Color::Red))), chunks[4]);
+            f.render_widget(Paragraph::new(Span::styled(err, Style::default().fg(Color::Red))), chunks[6]);
         } else if app.auth_token.is_some() {
-            f.render_widget(Paragraph::new(Span::styled("✓ Authenticated", Style::default().fg(Color::Green))), chunks[4]);
+            f.render_widget(Paragraph::new(Span::styled("✓ Authenticated", Style::default().fg(Color::Green))), chunks[6]);
         } else {
-            f.render_widget(Paragraph::new(Span::styled("Waiting for input...", Style::default().fg(Color::DarkGray))), chunks[4]);
+            f.render_widget(Paragraph::new(Span::styled("Waiting for input...", Style::default().fg(Color::DarkGray))), chunks[6]);
         }
+    }
+
+    if app.show_upload_confirm {
+        let area = centered_rect_fixed(50, 10, size);
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(Span::styled(" Upload Modified Gist? ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .style(Style::default().bg(Color::Black));
+        f.render_widget(block.clone(), area);
+        let inner = block.inner(area);
+        
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // Filename
+                Constraint::Length(2), // Question
+                Constraint::Length(1), // Spacer
+                Constraint::Length(1), // Buttons
+                Constraint::Min(0),
+            ])
+            .split(inner);
+
+        let filename = app.pending_gist_file.as_ref().and_then(|p| p.file_name()).map(|f| f.to_string_lossy()).unwrap_or_default();
+        f.render_widget(Paragraph::new(format!("File '{}' was modified locally.", filename)).alignment(ratatui::layout::Alignment::Center), chunks[0]);
+        f.render_widget(Paragraph::new("\nUpload changes to GitHub Gist?").alignment(ratatui::layout::Alignment::Center), chunks[1]);
+
+        let button_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(50),
+                Constraint::Percentage(50),
+            ])
+            .split(chunks[3]);
+
+        let is_yes_hovered = if let Some((mx, my)) = app.mouse_pos {
+            button_chunks[0].contains(Position::new(mx, my))
+        } else { false };
+        let is_no_hovered = if let Some((mx, my)) = app.mouse_pos {
+            button_chunks[1].contains(Position::new(mx, my))
+        } else { false };
+
+        let yes_style = if is_yes_hovered {
+            Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Green).bg(Color::Rgb(20, 40, 20))
+        };
+        let no_style = if is_no_hovered {
+            Style::default().fg(Color::Black).bg(Color::Red).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Red).bg(Color::Rgb(40, 20, 20))
+        };
+
+        f.render_widget(Paragraph::new(" [Y] Yes, Upload ").style(yes_style).alignment(ratatui::layout::Alignment::Center), button_chunks[0]);
+        f.render_widget(Paragraph::new(" [N] No, Keep Local ").style(no_style).alignment(ratatui::layout::Alignment::Center), button_chunks[1]);
     }
 }
 

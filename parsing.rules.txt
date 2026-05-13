@@ -1,0 +1,26 @@
+all commands/scripts should be made in one line buttons like this:
+
+For commands
+--------------------------
+two line code like this
+`#sysinfo system info
+print lsb-release -a`
+
+ should become a button label 'sysinfo system info print lsb_release -a' 
+ where:
+1. `sysinfo` is identifier
+2.`system info` is description tags in grey
+3.`print lsb_release -a` is code preview in light grey
+
+For scripts
+--------------------------
+`!#/bin/bash
+# pinger app running
+disconn_start=1
+last_connected=2`
+
+ should become a button label 'pinger SCRIPT app running disconn_start=1 last_connected=2' 
+ where:
+1. `pinger` is identifier
+2. `SCRIPT app running` is description tags in grey
+3. `disconn_start=1 last_connected=2` is code preview in light grey
