@@ -18,9 +18,9 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            suffix: x64
+            release_name: tbm
           - target: aarch64-unknown-linux-gnu
-            suffix: arm64
+            release_name: tbm.arm
 
     steps:
       - uses: actions/checkout@v4
@@ -51,10 +51,37 @@ jobs:
       - name: Rename binary
         run: |
           mkdir -p bin
-          cp target/${{ matrix.target }}/release/rust-dashboard bin/termbookman-${{ matrix.suffix }}
+          cp target/${{ matrix.target }}/release/rust-dashboard bin/${{ matrix.release_name }}
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: termbookman-${{ matrix.suffix }}
-          path: bin/termbookman-${{ matrix.suffix }}
+          name: ${{ matrix.release_name }}
+          path: bin/${{ matrix.release_name }}
+
+  release:
+    name: Create Release
+    needs: build
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bin
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          files: |
+            bin/tbm
+            bin/tbm.arm
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
