@@ -67,6 +67,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Get current date
+        id: date
+        run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
       - name: Download Artifacts
         uses: actions/download-artifact@v4
         with:
@@ -76,8 +80,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ github.run_number }}
-          name: Build ${{ github.run_number }}
+          tag_name: v${{ steps.date.outputs.date }}
+          name: v${{ steps.date.outputs.date }}
           files: |
             bin/tbm
             bin/tbm.arm
