@@ -164,6 +164,10 @@ fn check_update_disabled() -> Option<String> {
     None
 }
 
+use crate::config::get_config_dir;
+
+const DEFAULT_COMMANDS: &str = include_str!("../commands.txt");
+
 pub fn load_commands(
     exe_dir: &std::path::Path,
 ) -> (
@@ -180,16 +184,23 @@ pub fn load_commands(
     let mut paths = Vec::new();
     let mut label_counts = std::collections::HashMap::new();
 
-    // Load local commands
-    let cmd_path = exe_dir.join("commands.txt");
-    if let Ok(content) = std::fs::read_to_string(&cmd_path) {
-        let (l, c, i) = parse_lines(&content, "cmd", &mut label_counts);
-        mtimes.extend(vec![None; l.len()]);
-        paths.extend(vec![Some(cmd_path.clone()); l.len()]);
-        labels.extend(l);
-        commands.extend(c);
-        infos.extend(i);
+    // Load commands from the same directory as config.toml, or create it there with defaults.
+    let config_dir = get_config_dir().unwrap_or_else(|| exe_dir.to_path_buf());
+    if !config_dir.exists() {
+        let _ = std::fs::create_dir_all(&config_dir);
     }
+    let cmd_path = config_dir.join("commands.txt");
+    if !cmd_path.exists() {
+        let _ = std::fs::write(&cmd_path, DEFAULT_COMMANDS);
+    }
+    let content =
+        std::fs::read_to_string(&cmd_path).unwrap_or_else(|_| DEFAULT_COMMANDS.to_string());
+    let (l, c, i) = parse_lines(&content, "cmd", &mut label_counts);
+    mtimes.extend(vec![None; l.len()]);
+    paths.extend(vec![Some(cmd_path.clone()); l.len()]);
+    labels.extend(l);
+    commands.extend(c);
+    infos.extend(i);
 
     // Load cached Gists
     if let Some(proj_dirs) = directories::ProjectDirs::from("", "", "termbookman") {

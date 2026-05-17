@@ -4,7 +4,7 @@ use std::error::Error;
 
 use std::path::PathBuf;
 
-fn get_config_dir() -> Option<PathBuf> {
+pub fn get_config_dir() -> Option<PathBuf> {
     if let Ok(sudo_user) = std::env::var("SUDO_USER") {
         let home = if sudo_user == "root" {
             PathBuf::from("/root")
