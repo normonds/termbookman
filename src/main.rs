@@ -31,12 +31,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         .parent()
         .ok_or("Could not find executable directory")?;
     let args: Vec<String> = std::env::args().collect();
+
+    if args.len() > 1 {
+        let action = &args[1];
+        if action == "-v" || action == "--version" {
+            println!("build date/time: {}", env!("BUILD_DATE_TIME"));
+            return Ok(());
+        }
+    }
+
     let (labels, sidebar_commands, sidebar_infos, sidebar_mtimes, sidebar_paths) =
         load_commands(exe_dir);
 
     if args.len() > 1 {
         let action = &args[1];
-
         if action == "print" && args.len() > 2 {
             if args[2] == "script" && args.len() > 3 {
                 // termbookman print script <label>
@@ -631,7 +639,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     };
 
                     let is_arm = std::env::consts::ARCH == "aarch64";
-                    let final_url = if is_arm {
+                    let final_url = if is_arm && !update_url.contains("/tbm.arm") {
                         update_url.replace("/download/tbm", "/download/tbm.arm")
                     } else {
                         update_url
@@ -644,6 +652,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                     let client = reqwest::blocking::Client::builder()
                         .timeout(std::time::Duration::from_secs(60))
+                        .redirect(reqwest::redirect::Policy::limited(10))
+                        .user_agent("termbookman-updater/0.1")
                         .build()
                         .unwrap();
 
