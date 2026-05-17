@@ -1075,7 +1075,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let _ = child.kill();
-    execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
+
+    let mut stdout = io::stdout();
+    let _ = write!(stdout, "\x1b[?1006l\x1b[?1000l");
+    let _ = stdout.flush();
+    execute!(stdout, DisableMouseCapture, LeaveAlternateScreen)?;
 
     while event::poll(Duration::from_millis(10))? {
         let _ = event::read()?;
