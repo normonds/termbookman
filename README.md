@@ -1,8 +1,10 @@
-# termbookman (rust-dashboard)
+# termbookman
 
 `termbookman` is a high-performance terminal dashboard built with Rust and the Ratatui TUI framework. It provides a specialized environment for developers, combining a live PTY terminal with an integrated command sidebar and GitHub Gist management.
 
 Coded mostly by Google's Gemini 3
+
+![Screenshot](helpers/screenshot.gif)
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)
