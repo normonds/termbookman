@@ -1,28 +1,33 @@
-use std::error::Error;
-use serde_json;
 use reqwest;
+use serde_json;
+use std::error::Error;
 
-pub fn upload_gist(token: &str, file_path: &std::path::Path, remote_filename: &str) -> Result<(), Box<dyn Error>> {
+pub fn upload_gist(
+    token: &str,
+    file_path: &std::path::Path,
+    remote_filename: &str,
+) -> Result<(), Box<dyn Error>> {
     let content = std::fs::read_to_string(file_path)?;
-    
+
     // We need to find the Gist ID. We can scan cached gists to find which one this file belongs to.
     let client = reqwest::blocking::Client::builder()
         .user_agent("termbookman/0.1.0")
         .build()?;
-    
+
     let url = "https://api.github.com/gists";
-    let res = client.get(url)
+    let res = client
+        .get(url)
         .header("Authorization", format!("token {}", token))
         .header("Accept", "application/vnd.github.v3+json")
         .send()?;
-    
+
     if !res.status().is_success() {
         return Err(format!("Failed to list gists: {}", res.status()).into());
     }
-    
+
     let gists: serde_json::Value = res.json()?;
     let mut gist_id = None;
-    
+
     if let Some(arr) = gists.as_array() {
         for gist in arr {
             if let Some(files) = gist["files"].as_object() {
@@ -33,25 +38,29 @@ pub fn upload_gist(token: &str, file_path: &std::path::Path, remote_filename: &s
             }
         }
     }
-    
+
     if let Some(gist_id) = gist_id {
         // Update existing gist
         let update_url = format!("https://api.github.com/gists/{}", gist_id);
-        
+
         let mut files = serde_json::Map::new();
         let mut file_data = serde_json::Map::new();
         file_data.insert("content".to_string(), serde_json::Value::String(content));
-        files.insert(remote_filename.to_string(), serde_json::Value::Object(file_data));
-        
+        files.insert(
+            remote_filename.to_string(),
+            serde_json::Value::Object(file_data),
+        );
+
         let mut body = serde_json::Map::new();
         body.insert("files".to_string(), serde_json::Value::Object(files));
-        
-        let res = client.patch(update_url)
+
+        let res = client
+            .patch(update_url)
             .header("Authorization", format!("token {}", token))
             .header("Accept", "application/vnd.github.v3+json")
             .json(&body)
             .send()?;
-            
+
         if res.status().is_success() {
             Ok(())
         } else {
@@ -60,23 +69,30 @@ pub fn upload_gist(token: &str, file_path: &std::path::Path, remote_filename: &s
     } else {
         // Create new gist
         let create_url = "https://api.github.com/gists";
-        
+
         let mut files = serde_json::Map::new();
         let mut file_data = serde_json::Map::new();
         file_data.insert("content".to_string(), serde_json::Value::String(content));
-        files.insert(remote_filename.to_string(), serde_json::Value::Object(file_data));
-        
+        files.insert(
+            remote_filename.to_string(),
+            serde_json::Value::Object(file_data),
+        );
+
         let mut body = serde_json::Map::new();
-        body.insert("description".to_string(), serde_json::Value::String("Uploaded via termbookman".to_string()));
+        body.insert(
+            "description".to_string(),
+            serde_json::Value::String("Uploaded via termbookman".to_string()),
+        );
         body.insert("public".to_string(), serde_json::Value::Bool(false));
         body.insert("files".to_string(), serde_json::Value::Object(files));
-        
-        let res = client.post(create_url)
+
+        let res = client
+            .post(create_url)
             .header("Authorization", format!("token {}", token))
             .header("Accept", "application/vnd.github.v3+json")
             .json(&body)
             .send()?;
-            
+
         if res.status().is_success() {
             Ok(())
         } else {
@@ -91,20 +107,21 @@ pub fn delete_gist(token: &str, remote_filename: &str) -> Result<(), Box<dyn Err
     let client = reqwest::blocking::Client::builder()
         .user_agent("termbookman/0.1.0")
         .build()?;
-    
+
     let url = "https://api.github.com/gists";
-    let res = client.get(url)
+    let res = client
+        .get(url)
         .header("Authorization", format!("token {}", token))
         .header("Accept", "application/vnd.github.v3+json")
         .send()?;
-    
+
     if !res.status().is_success() {
         return Err(format!("Failed to list gists: {}", res.status()).into());
     }
-    
+
     let gists: serde_json::Value = res.json()?;
     let mut gist_id = None;
-    
+
     if let Some(arr) = gists.as_array() {
         for gist in arr {
             if let Some(files) = gist["files"].as_object() {
@@ -115,14 +132,15 @@ pub fn delete_gist(token: &str, remote_filename: &str) -> Result<(), Box<dyn Err
             }
         }
     }
-    
+
     if let Some(gist_id) = gist_id {
         let delete_url = format!("https://api.github.com/gists/{}", gist_id);
-        let res = client.delete(delete_url)
+        let res = client
+            .delete(delete_url)
             .header("Authorization", format!("token {}", token))
             .header("Accept", "application/vnd.github.v3+json")
             .send()?;
-            
+
         if res.status().is_success() {
             Ok(())
         } else {

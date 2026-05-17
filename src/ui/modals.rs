@@ -1,10 +1,10 @@
-use ratatui::Frame;
-use ratatui::layout::{Layout, Constraint, Direction, Rect};
-use ratatui::style::{Color, Style, Modifier};
+use crate::app::App;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::Frame;
 use std::time::Instant;
-use crate::app::App;
 
 pub fn render_modals(f: &mut Frame, app: &mut App, area: Rect) {
     if app.show_menu {
@@ -16,23 +16,33 @@ pub fn render_modals(f: &mut Frame, app: &mut App, area: Rect) {
             .border_style(Style::default().fg(Color::Green))
             .style(Style::default().bg(Color::Black));
         let menu_items = vec![
-            ListItem::new("b: Run Btop").style(Style::default().bg(Color::Black)), 
-            ListItem::new("s: Check Space").style(Style::default().bg(Color::Black)), 
-            ListItem::new("q: Close").style(Style::default().bg(Color::Black))
+            ListItem::new("b: Run Btop").style(Style::default().bg(Color::Black)),
+            ListItem::new("s: Check Space").style(Style::default().bg(Color::Black)),
+            ListItem::new("q: Close").style(Style::default().bg(Color::Black)),
         ];
-        f.render_widget(List::new(menu_items).block(menu_block).style(Style::default().bg(Color::Black)), area);
+        f.render_widget(
+            List::new(menu_items)
+                .block(menu_block)
+                .style(Style::default().bg(Color::Black)),
+            area,
+        );
     }
 
     if app.show_settings_modal {
-        let modal_area = centered_rect_fixed(50, 20, area);
+        let modal_area = centered_rect_fixed(100, 26, area);
         f.render_widget(Clear, modal_area);
-        
+
         let block = Block::default()
-            .title(Span::styled(" Settings & GitHub Auth ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)))
+            .title(Span::styled(
+                " Settings & GitHub Auth ",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Magenta))
             .style(Style::default().bg(Color::Black));
-            
+
         f.render_widget(block.clone(), modal_area);
         let inner_area = block.inner(modal_area);
 
@@ -44,78 +54,243 @@ pub fn render_modals(f: &mut Frame, app: &mut App, area: Rect) {
                 Constraint::Length(2), // Device Flow
                 Constraint::Length(1), // PAT Header
                 Constraint::Length(3), // PAT Input
+                Constraint::Length(1), // Status
+                Constraint::Length(1), // Spacer
+                Constraint::Length(1), // Repo URL Header
+                Constraint::Length(3), // Repo URL Input
+                Constraint::Length(1), // Update Warning (new)
+                Constraint::Length(1), // Update Button
+                Constraint::Length(1), // Spacer
                 Constraint::Length(1), // Editor Header
                 Constraint::Length(3), // Editor Input
-                Constraint::Min(0),    // Status
+                Constraint::Min(0),
             ])
             .split(inner_area);
 
         // --- Device Flow Section ---
         if let (Some(uri), Some(code)) = (&app.github_verification_uri, &app.github_user_code) {
             let device_text = format!("1. Open {}   2. Enter: {}", uri, code);
-            f.render_widget(Paragraph::new("GITHUB DEVICE FLOW:").style(Style::default().fg(Color::DarkGray)), chunks[0]);
-            f.render_widget(Paragraph::new(Span::styled(device_text, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))), chunks[1]);
+            f.render_widget(
+                Paragraph::new("GITHUB DEVICE FLOW:").style(Style::default().fg(Color::DarkGray)),
+                chunks[0],
+            );
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    device_text,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                chunks[1],
+            );
         } else {
-            f.render_widget(Paragraph::new("GITHUB DEVICE FLOW:").style(Style::default().fg(Color::DarkGray)), chunks[0]);
-            f.render_widget(Paragraph::new("Enter the code on GitHub to authenticate...").style(Style::default().fg(Color::DarkGray)), chunks[1]);
+            f.render_widget(
+                Paragraph::new("GITHUB DEVICE FLOW:").style(Style::default().fg(Color::DarkGray)),
+                chunks[0],
+            );
+            f.render_widget(
+                Paragraph::new("Enter the code on GitHub to authenticate...")
+                    .style(Style::default().fg(Color::DarkGray)),
+                chunks[1],
+            );
         }
 
         // --- PAT Section ---
-        f.render_widget(Paragraph::new("GITHUB PERSONAL ACCESS TOKEN (PAT):").style(Style::default().fg(Color::DarkGray)), chunks[2]);
-        
+        f.render_widget(
+            Paragraph::new("GITHUB PERSONAL ACCESS TOKEN (PAT):")
+                .style(Style::default().fg(Color::DarkGray)),
+            chunks[2],
+        );
+
         let pat_style = if app.is_pat_focused {
-            Style::default().fg(Color::Yellow).bg(Color::Rgb(20, 20, 20))
+            Style::default()
+                .fg(Color::Yellow)
+                .bg(Color::Rgb(20, 20, 20))
         } else {
             Style::default().fg(Color::Gray).bg(Color::Black)
         };
 
-        let pat_block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(if app.is_pat_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) });
+        let pat_block =
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(if app.is_pat_focused {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                });
 
         let now = Instant::now().duration_since(app.start_time).as_millis();
-        let pat_cursor = if app.is_pat_focused && (now / 500) % 2 == 0 { "_" } else { " " };
+        let pat_cursor = if app.is_pat_focused && (now / 500) % 2 == 0 {
+            "_"
+        } else {
+            " "
+        };
         let pat_display = format!(" {}{} ", app.pat_input, pat_cursor);
-        f.render_widget(Paragraph::new(pat_display).style(pat_style).block(pat_block), chunks[3]);
+        f.render_widget(
+            Paragraph::new(pat_display)
+                .style(pat_style)
+                .block(pat_block),
+            chunks[3],
+        );
 
-        // --- Editor Section ---
-        f.render_widget(Paragraph::new("EXTERNAL EDITOR:").style(Style::default().fg(Color::DarkGray)), chunks[4]);
-        
-        let editor_style = if app.is_editor_focused {
-            Style::default().fg(Color::Yellow).bg(Color::Rgb(20, 20, 20))
+        // --- Status/Error Section (Moved above Repo URL) ---
+        if let Some(err) = &app.login_error {
+            f.render_widget(
+                Paragraph::new(Span::styled(err, Style::default().fg(Color::Red))),
+                chunks[4],
+            );
+        } else if app.auth_token.is_some() {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "✓ Authenticated",
+                    Style::default().fg(Color::Green),
+                )),
+                chunks[4],
+            );
+        } else {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "Waiting for input...",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                chunks[4],
+            );
+        }
+
+        // --- Update URL Section ---
+        f.render_widget(
+            Paragraph::new("UPDATE URL:").style(Style::default().fg(Color::DarkGray)),
+            chunks[6],
+        );
+
+        let update_url_style = if app.is_update_url_focused {
+            Style::default()
+                .fg(Color::Yellow)
+                .bg(Color::Rgb(20, 20, 20))
         } else {
             Style::default().fg(Color::Gray).bg(Color::Black)
         };
 
-        let editor_block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(if app.is_editor_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) });
+        let update_url_block =
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(if app.is_update_url_focused {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                });
 
-        let editor_cursor = if app.is_editor_focused && (now / 500) % 2 == 0 { "_" } else { " " };
-        let editor_display = format!(" {}{} ", app.editor_input, editor_cursor);
-        f.render_widget(Paragraph::new(editor_display).style(editor_style).block(editor_block), chunks[5]);
-
-        // --- Status/Error Section ---
-        if let Some(err) = &app.login_error {
-            f.render_widget(Paragraph::new(Span::styled(err, Style::default().fg(Color::Red))), chunks[6]);
-        } else if app.auth_token.is_some() {
-            f.render_widget(Paragraph::new(Span::styled("✓ Authenticated", Style::default().fg(Color::Green))), chunks[6]);
+        let update_url_cursor = if app.is_update_url_focused && (now / 500) % 2 == 0 {
+            "_"
         } else {
-            f.render_widget(Paragraph::new(Span::styled("Waiting for input...", Style::default().fg(Color::DarkGray))), chunks[6]);
+            " "
+        };
+        let update_url_display = format!(" {}{} ", app.update_url_input, update_url_cursor);
+        f.render_widget(
+            Paragraph::new(update_url_display)
+                .style(update_url_style)
+                .block(update_url_block),
+            chunks[7],
+        );
+
+        // --- Update Warning Section (if restricted) ---
+        if let Some(warning) = &app.update_disabled_reason {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    warning,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .alignment(ratatui::layout::Alignment::Center),
+                chunks[8],
+            );
         }
+
+        // --- Update Button Section ---
+        let is_update_disabled = app.update_disabled_reason.is_some();
+        let is_update_hovered = if !is_update_disabled {
+            if let Some((mx, my)) = app.mouse_pos {
+                chunks[9].contains(ratatui::layout::Position::new(mx, my))
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let update_style = if is_update_disabled {
+            Style::default()
+                .fg(Color::DarkGray)
+                .bg(Color::Rgb(20, 20, 20))
+        } else if is_update_hovered {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan).bg(Color::Rgb(20, 40, 40))
+        };
+        f.render_widget(
+            Paragraph::new(" [ UPDATE ] ")
+                .style(update_style)
+                .alignment(ratatui::layout::Alignment::Center),
+            chunks[9],
+        );
+
+        // --- Editor Section ---
+        f.render_widget(
+            Paragraph::new("EXTERNAL EDITOR:").style(Style::default().fg(Color::DarkGray)),
+            chunks[11],
+        );
+
+        let editor_style = if app.is_editor_focused {
+            Style::default()
+                .fg(Color::Yellow)
+                .bg(Color::Rgb(20, 20, 20))
+        } else {
+            Style::default().fg(Color::Gray).bg(Color::Black)
+        };
+
+        let editor_block =
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(if app.is_editor_focused {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                });
+
+        let editor_cursor = if app.is_editor_focused && (now / 500) % 2 == 0 {
+            "_"
+        } else {
+            " "
+        };
+        let editor_display = format!(" {}{} ", app.editor_input, editor_cursor);
+        f.render_widget(
+            Paragraph::new(editor_display)
+                .style(editor_style)
+                .block(editor_block),
+            chunks[12],
+        );
     }
 
     if app.show_upload_confirm {
         let modal_area = centered_rect_fixed(50, 10, area);
         f.render_widget(Clear, modal_area);
         let block = Block::default()
-            .title(Span::styled(" Upload Modified Gist? ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
+            .title(Span::styled(
+                " Upload Modified Gist? ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow))
             .style(Style::default().bg(Color::Black));
         f.render_widget(block.clone(), modal_area);
         let inner = block.inner(modal_area);
-        
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -127,51 +302,86 @@ pub fn render_modals(f: &mut Frame, app: &mut App, area: Rect) {
             ])
             .split(inner);
 
-        let filename = app.pending_gist_file.as_ref().and_then(|p| p.file_name()).map(|f| f.to_string_lossy()).unwrap_or_default();
-        f.render_widget(Paragraph::new(format!("File '{}' was modified locally.", filename)).alignment(ratatui::layout::Alignment::Center), chunks[0]);
-        f.render_widget(Paragraph::new("\nUpload changes to GitHub Gist?").alignment(ratatui::layout::Alignment::Center), chunks[1]);
+        let filename = app
+            .pending_gist_file
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|f| f.to_string_lossy())
+            .unwrap_or_default();
+        f.render_widget(
+            Paragraph::new(format!("File '{}' was modified locally.", filename))
+                .alignment(ratatui::layout::Alignment::Center),
+            chunks[0],
+        );
+        f.render_widget(
+            Paragraph::new("\nUpload changes to GitHub Gist?")
+                .alignment(ratatui::layout::Alignment::Center),
+            chunks[1],
+        );
 
         let button_chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(50),
-                Constraint::Percentage(50),
-            ])
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(chunks[3]);
 
         let is_yes_hovered = if let Some((mx, my)) = app.mouse_pos {
             button_chunks[0].contains(ratatui::layout::Position::new(mx, my))
-        } else { false };
+        } else {
+            false
+        };
         let is_no_hovered = if let Some((mx, my)) = app.mouse_pos {
             button_chunks[1].contains(ratatui::layout::Position::new(mx, my))
-        } else { false };
+        } else {
+            false
+        };
 
         let yes_style = if is_yes_hovered {
-            Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Green).bg(Color::Rgb(20, 40, 20))
         };
         let no_style = if is_no_hovered {
-            Style::default().fg(Color::Black).bg(Color::Red).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Red).bg(Color::Rgb(40, 20, 20))
         };
 
-        f.render_widget(Paragraph::new(" [Y] Yes, Upload ").style(yes_style).alignment(ratatui::layout::Alignment::Center), button_chunks[0]);
-        f.render_widget(Paragraph::new(" [N] No, Keep Local ").style(no_style).alignment(ratatui::layout::Alignment::Center), button_chunks[1]);
+        f.render_widget(
+            Paragraph::new(" [Y] Yes, Upload ")
+                .style(yes_style)
+                .alignment(ratatui::layout::Alignment::Center),
+            button_chunks[0],
+        );
+        f.render_widget(
+            Paragraph::new(" [N] No, Keep Local ")
+                .style(no_style)
+                .alignment(ratatui::layout::Alignment::Center),
+            button_chunks[1],
+        );
     }
 
     if app.show_new_gist_dialog {
         let modal_area = centered_rect_fixed(50, 10, area);
         f.render_widget(Clear, modal_area);
         let block = Block::default()
-            .title(Span::styled(" New Gist Script ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
+            .title(Span::styled(
+                " New Gist Script ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
             .style(Style::default().bg(Color::Black));
         f.render_widget(block.clone(), modal_area);
         let inner = block.inner(modal_area);
-        
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -182,31 +392,47 @@ pub fn render_modals(f: &mut Frame, app: &mut App, area: Rect) {
             ])
             .split(inner);
 
-        f.render_widget(Paragraph::new("Enter a name for the new Gist script:").alignment(ratatui::layout::Alignment::Center), chunks[0]);
-        
+        f.render_widget(
+            Paragraph::new("Enter a name for the new Gist script:")
+                .alignment(ratatui::layout::Alignment::Center),
+            chunks[0],
+        );
+
         let input_block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan));
-        
+
         let now = Instant::now().duration_since(app.start_time).as_millis();
         let cursor = if (now / 500) % 2 == 0 { "_" } else { " " };
         let input_display = format!(" {}{} ", app.new_gist_name_input, cursor);
-        f.render_widget(Paragraph::new(input_display).style(Style::default().fg(Color::Cyan)).block(input_block), chunks[1]);
-        
-        f.render_widget(Paragraph::new("ENTER to confirm, ESC to cancel").style(Style::default().fg(Color::DarkGray)), chunks[2]);
+        f.render_widget(
+            Paragraph::new(input_display)
+                .style(Style::default().fg(Color::Cyan))
+                .block(input_block),
+            chunks[1],
+        );
+
+        f.render_widget(
+            Paragraph::new("ENTER to confirm, ESC to cancel")
+                .style(Style::default().fg(Color::DarkGray)),
+            chunks[2],
+        );
     }
 
     if app.show_delete_confirm {
         let modal_area = centered_rect_fixed(50, 10, area);
         f.render_widget(Clear, modal_area);
         let block = Block::default()
-            .title(Span::styled(" Confirm Deletion ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)))
+            .title(Span::styled(
+                " Confirm Deletion ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Red))
             .style(Style::default().bg(Color::Black));
         f.render_widget(block.clone(), modal_area);
         let inner = block.inner(modal_area);
-        
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -218,57 +444,103 @@ pub fn render_modals(f: &mut Frame, app: &mut App, area: Rect) {
             ])
             .split(inner);
 
-        let gist_name = app.gist_index_to_delete
+        let gist_name = app
+            .gist_index_to_delete
             .and_then(|idx| app.gist_items.get(idx))
             .cloned()
             .unwrap_or_else(|| "Unknown Script".to_string());
 
-        f.render_widget(Paragraph::new("Are you sure you want to delete this script?").alignment(ratatui::layout::Alignment::Center), chunks[0]);
-        f.render_widget(Paragraph::new(format!("'{}'\nIt will be removed locally and from GitHub.", gist_name)).alignment(ratatui::layout::Alignment::Center), chunks[1]);
+        f.render_widget(
+            Paragraph::new("Are you sure you want to delete this script?")
+                .alignment(ratatui::layout::Alignment::Center),
+            chunks[0],
+        );
+        f.render_widget(
+            Paragraph::new(format!(
+                "'{}'\nIt will be removed locally and from GitHub.",
+                gist_name
+            ))
+            .alignment(ratatui::layout::Alignment::Center),
+            chunks[1],
+        );
 
         let button_chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(50),
-                Constraint::Percentage(50),
-            ])
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(chunks[3]);
 
         let is_yes_hovered = if let Some((mx, my)) = app.mouse_pos {
             button_chunks[0].contains(ratatui::layout::Position::new(mx, my))
-        } else { false };
+        } else {
+            false
+        };
         let is_no_hovered = if let Some((mx, my)) = app.mouse_pos {
             button_chunks[1].contains(ratatui::layout::Position::new(mx, my))
-        } else { false };
+        } else {
+            false
+        };
 
         let yes_style = if is_yes_hovered {
-            Style::default().fg(Color::Black).bg(Color::Red).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Red).bg(Color::Rgb(40, 20, 20))
         };
         let no_style = if is_no_hovered {
-            Style::default().fg(Color::Black).bg(Color::Gray).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Gray)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Gray).bg(Color::Rgb(30, 30, 30))
         };
 
-        f.render_widget(Paragraph::new(" [Y] Yes, Delete ").style(yes_style).alignment(ratatui::layout::Alignment::Center), button_chunks[0]);
-        f.render_widget(Paragraph::new(" [N] No, Cancel ").style(no_style).alignment(ratatui::layout::Alignment::Center), button_chunks[1]);
+        f.render_widget(
+            Paragraph::new(" [Y] Yes, Delete ")
+                .style(yes_style)
+                .alignment(ratatui::layout::Alignment::Center),
+            button_chunks[0],
+        );
+        f.render_widget(
+            Paragraph::new(" [N] No, Cancel ")
+                .style(no_style)
+                .alignment(ratatui::layout::Alignment::Center),
+            button_chunks[1],
+        );
     }
 }
 
 pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage((100 - percent_y) / 2), Constraint::Percentage(percent_y), Constraint::Percentage((100 - percent_y) / 2)].as_ref())
+        .constraints(
+            [
+                Constraint::Percentage((100 - percent_y) / 2),
+                Constraint::Percentage(percent_y),
+                Constraint::Percentage((100 - percent_y) / 2),
+            ]
+            .as_ref(),
+        )
         .split(r);
     Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage((100 - percent_x) / 2), Constraint::Percentage(percent_x), Constraint::Percentage((100 - percent_x) / 2)].as_ref())
+        .constraints(
+            [
+                Constraint::Percentage((100 - percent_x) / 2),
+                Constraint::Percentage(percent_x),
+                Constraint::Percentage((100 - percent_x) / 2),
+            ]
+            .as_ref(),
+        )
         .split(popup_layout[1])[1]
 }
 
 pub fn centered_rect_fixed(width: u16, height: u16, r: Rect) -> Rect {
+    let width = width.min(r.width.saturating_sub(4));
+    let height = height.min(r.height.saturating_sub(4));
+
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -277,7 +549,7 @@ pub fn centered_rect_fixed(width: u16, height: u16, r: Rect) -> Rect {
             Constraint::Min(0),
         ])
         .split(r);
-        
+
     Layout::default()
         .direction(Direction::Horizontal)
         .constraints([

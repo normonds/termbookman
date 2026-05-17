@@ -9,7 +9,7 @@ cargo build --release --target aarch64-unknown-linux-gnu
 
 # Copy the resulting binary to the project root
 if [ -f target/aarch64-unknown-linux-gnu/release/rust-dashboard ]; then
-    cp target/aarch64-unknown-linux-gnu/release/rust-dashboard ./termbookman.arm
+    cp target/aarch64-unknown-linux-gnu/release/rust-dashboard ./tbm.arm
     echo "------------------------------------------------"
     echo "Build complete! ARM binary: ./termbookman.arm"
     echo "------------------------------------------------"

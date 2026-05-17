@@ -1,11 +1,11 @@
-use ratatui::Frame;
-use ratatui::layout::{Layout, Constraint, Direction, Rect};
 use crate::app::App;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::Frame;
 
-pub mod terminal;
+pub mod modals;
 pub mod sidebar;
 pub mod statusbar;
-pub mod modals;
+pub mod terminal;
 
 pub struct LayoutResults {
     pub term_area: Rect,
@@ -28,12 +28,12 @@ pub fn calculate_layout(size: Rect, sidebar_width: u16) -> LayoutResults {
 
     let term_area = top_chunks[0];
     let right_pane = top_chunks[1];
-    
+
     let right_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Length(1), // Terminal Scrollbar / Resize Handle
-            Constraint::Length(0), 
+            Constraint::Length(0),
             Constraint::Fill(1),   // Sidebar Items
             Constraint::Length(1), // Sidebar Scrollbar
         ])
@@ -55,7 +55,7 @@ pub fn calculate_layout(size: Rect, sidebar_width: u16) -> LayoutResults {
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let layout = calculate_layout(f.size(), app.sidebar_width);
-    
+
     terminal::render_terminal(f, app, layout.term_area, layout.scrollbar_area);
     sidebar::render_sidebar(f, app, layout.sidebar_area, layout.sidebar_scrollbar_area);
     statusbar::render_statusbars(f, app, &layout.status_chunks);

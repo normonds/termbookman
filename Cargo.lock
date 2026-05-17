@@ -1413,6 +1413,7 @@ dependencies = [
  "crossterm",
  "directories",
  "futures",
+ "libc",
  "portable-pty",
  "ratatui 0.26.3",
  "reqwest",

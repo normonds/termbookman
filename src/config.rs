@@ -1,6 +1,21 @@
+use crate::utils::log_debug;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use crate::utils::log_debug;
+
+use std::path::PathBuf;
+
+fn get_config_dir() -> Option<PathBuf> {
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        let home = if sudo_user == "root" {
+            PathBuf::from("/root")
+        } else {
+            PathBuf::from("/home").join(sudo_user)
+        };
+        return Some(home.join(".config").join("termbookman"));
+    }
+
+    directories::ProjectDirs::from("", "", "termbookman").map(|p| p.config_dir().to_path_buf())
+}
 
 #[derive(Deserialize, Serialize, Clone, Default)]
 pub struct Config {
@@ -26,18 +41,37 @@ pub struct UiConfig {
     pub lower_statusbar_bg: String,
 }
 
-fn default_terminal_bg() -> String { "#000000".to_string() }
-fn default_sidebar_bg() -> String { "#000000".to_string() }
-fn default_statusbar_bg() -> String { "#000000".to_string() }
+fn default_terminal_bg() -> String {
+    "#000000".to_string()
+}
+fn default_sidebar_bg() -> String {
+    "#000000".to_string()
+}
+fn default_statusbar_bg() -> String {
+    "#000000".to_string()
+}
 
-pub fn default_editor() -> String { "nano".to_string() }
+pub fn default_editor() -> String {
+    "nano".to_string()
+}
 
 #[derive(Deserialize, Serialize, Clone, Default)]
 pub struct AuthConfig {
     pub github_client_id: Option<String>,
     pub personal_access_token: Option<String>,
+    #[serde(default = "default_repo_url")]
+    pub github_repo_url: String,
+    #[serde(default = "default_update_url")]
+    pub update_url: String,
     #[serde(default)]
     pub scope: String,
+}
+
+fn default_repo_url() -> String {
+    "https://github.com/normonds/termbookman".to_string()
+}
+fn default_update_url() -> String {
+    "https://github.com/normonds/termbookman/releases/latest/download/tbm".to_string()
 }
 
 #[derive(Deserialize, Serialize, Clone, Default)]
@@ -63,21 +97,38 @@ pub struct StatusBarItem {
 
 #[derive(Deserialize, Serialize, Clone, Default, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum ItemType { #[default] Button, Spacer, SystemStats, GitInfo, TimeAndScroll, SelectedCommandInfo }
+pub enum ItemType {
+    #[default]
+    Button,
+    Spacer,
+    SystemStats,
+    GitInfo,
+    TimeAndScroll,
+    SelectedCommandInfo,
+}
 
 #[derive(Deserialize, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum ActionType { ToggleMenu, CopySelection, SendCommand, Quit, ShowSettingsModal, FetchGists }
+pub enum ActionType {
+    ToggleMenu,
+    CopySelection,
+    SendCommand,
+    Quit,
+    ShowSettingsModal,
+    FetchGists,
+}
 
 #[derive(Deserialize, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum ConditionType { HasGit, HasSelection }
+pub enum ConditionType {
+    HasGit,
+    HasSelection,
+}
 
 pub fn save_config(config: &Config) -> Result<(), Box<dyn Error>> {
-    if let Some(proj_dirs) = directories::ProjectDirs::from("", "", "termbookman") {
-        let config_dir = proj_dirs.config_dir();
+    if let Some(config_dir) = get_config_dir() {
         if !config_dir.exists() {
-            std::fs::create_dir_all(config_dir)?;
+            std::fs::create_dir_all(&config_dir)?;
         }
         let config_file = config_dir.join("config.toml");
         let content = toml::to_string_pretty(config)?;
@@ -99,6 +150,7 @@ lower_statusbar_bg = "#000000"
 [auth]
 scope = "gist"
 personal_access_token = "YOUR_TOKEN_HERE"
+update_url = "https://github.com/normonds/termbookman/releases/latest/download/tbm"
 
 [statusbar]
 [[statusbar.upper]]
@@ -189,19 +241,18 @@ action = "quit"
 color = "red"
 hover_color = "light_red"
 "##;
-    
-    if let Some(proj_dirs) = directories::ProjectDirs::from("", "", "termbookman") {
-        let config_dir = proj_dirs.config_dir();
+
+    if let Some(config_dir) = get_config_dir() {
         let config_file = config_dir.join("config.toml");
         log_debug(&format!("Checking config at: {:?}", config_file));
-        
+
         if config_file.exists() {
             if let Ok(content) = std::fs::read_to_string(&config_file) {
                 match toml::from_str(&content) {
                     Ok(config) => {
                         log_debug("Config loaded successfully from file");
                         return config;
-                    },
+                    }
                     Err(e) => {
                         log_debug(&format!("Config parse error: {}", e));
                     }
@@ -209,7 +260,7 @@ hover_color = "light_red"
             }
         } else {
             if !config_dir.exists() {
-                let _ = std::fs::create_dir_all(config_dir);
+                let _ = std::fs::create_dir_all(&config_dir);
             }
             log_debug("Config file not found, writing default");
             let _ = std::fs::write(&config_file, default_config);
@@ -217,7 +268,7 @@ hover_color = "light_red"
     } else {
         log_debug("Could not determine project directories");
     }
-    
+
     log_debug("Falling back to default config");
     toml::from_str(default_config).unwrap_or_default()
 }
