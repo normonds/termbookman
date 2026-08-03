@@ -100,7 +100,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                         String::new()
                     };
 
-                    if cmd.contains("<prompt:") {
+                    if sidebar_infos[i].starts_with("__SCRIPT__") {
+                        // Script entry: `bash <file>` (no -c) so only read permission is needed.
+                        println!("\x1b[90mExecuting script{}: {}\x1b[0m", gist_info, cmd);
+                        std::process::Command::new("bash").arg(cmd).status()?;
+                    } else if cmd.contains("<prompt:") {
                         let mut final_cmd = cmd.clone();
                         while let Some(start) = final_cmd.find("<prompt:") {
                             if let Some(end) = final_cmd[start..].find(">") {
@@ -132,6 +136,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             .arg(&final_cmd)
                             .status()?;
                     } else {
+                        // Plain command: `bash -c <cmd>`
                         println!("\x1b[90mExecuting{}: {}\x1b[0m", gist_info, cmd);
                         std::process::Command::new("bash")
                             .arg("-c")
@@ -140,6 +145,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     return Ok(());
                 }
+            } else {
+                // Label not found anywhere — nothing to run.
+                eprintln!(
+                    "\x1b[90mtermbookman: command not found: {}\x1b[0m",
+                    search_label
+                );
             }
         }
         return Ok(());
