@@ -2,13 +2,32 @@ use chrono;
 use ratatui::style::Color;
 use std::io::Write;
 
+static LOG_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn log_debug(msg: &str) {
+    let _lock = LOG_MUTEX.lock().unwrap();
+    let log_path = "debug.log";
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
-        .open("debug.log")
+        .open(log_path)
     {
-        let _ = writeln!(f, "[{}] {}", chrono::Local::now().format("%H:%M:%S"), msg);
+        let _ = writeln!(
+            f,
+            "[{}] {}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            msg
+        );
+    }
+
+    // Limit to 1000 lines
+    if let Ok(content) = std::fs::read_to_string(log_path) {
+        let lines: Vec<&str> = content.lines().collect();
+        if lines.len() > 1000 {
+            let start = lines.len() - 1000;
+            let trimmed = lines[start..].join("\n") + "\n";
+            let _ = std::fs::write(log_path, trimmed);
+        }
     }
 }
 

@@ -25,6 +25,7 @@ pub fn render_statusbars(f: &mut Frame, app: &mut App, chunks: &[Rect]) {
                 } else if item.type_ == ItemType::Spacer
                     || item.type_ == ItemType::GitInfo
                     || item.type_ == ItemType::SelectedCommandInfo
+                    || item.type_ == ItemType::GithubStatus
                 {
                     Constraint::Fill(1)
                 } else if let Some(label) = &item.label {
@@ -201,6 +202,28 @@ pub fn render_statusbars(f: &mut Frame, app: &mut App, chunks: &[Rect]) {
                 }
                 ItemType::Spacer => {
                     f.render_widget(Paragraph::new("").style(Style::default().bg(bar_bg)), chunk);
+                }
+                ItemType::GithubStatus => {
+                    if let Some(ref msg) = app.github_status_msg {
+                        let color = if app.github_status_is_error {
+                            Color::Red
+                        } else {
+                            Color::Cyan
+                        };
+                        f.render_widget(
+                            Paragraph::new(Span::styled(
+                                format!(" {}", msg),
+                                Style::default().fg(color).add_modifier(Modifier::BOLD),
+                            ))
+                            .style(Style::default().bg(bar_bg)),
+                            chunk,
+                        );
+                    } else {
+                        f.render_widget(
+                            Paragraph::new("").style(Style::default().bg(bar_bg)),
+                            chunk,
+                        );
+                    }
                 }
             }
         }

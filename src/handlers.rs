@@ -99,16 +99,19 @@ pub fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sen
                                 let tx = tx.clone();
                                 let display_name = remote_name.clone();
                                 std::thread::spawn(move || {
+                                    log_debug(&format!("Uploading Gist manually: {}", display_name));
                                     let _ = tx.send(Message::GistUploadStatus(
                                         format!("[Uploading Gist: {}]", display_name),
                                         true,
                                     ));
                                     if let Err(e) = upload_gist(&token, &path, &remote_name) {
+                                        log_debug(&format!("✗ Gist upload failed: {}", e));
                                         let _ = tx.send(Message::GistUploadStatus(
                                             format!("✗ Gist upload failed: {}", e),
                                             false,
                                         ));
                                     } else {
+                                        log_debug(&format!("✓ Gist updated: {}", display_name));
                                         let _ = tx.send(Message::GistUploadStatus(
                                             format!("✓ Gist updated: {}", display_name),
                                             true,
@@ -339,6 +342,21 @@ pub fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sen
                             }
                             ActionType::Quit => {
                                 app.should_quit = true;
+                            }
+                            ActionType::OpenLog => {
+                                let log_path = std::env::current_dir().unwrap_or_default().join("debug.log");
+                                if !log_path.exists() {
+                                    let _ = std::fs::write(&log_path, "");
+                                }
+                                if let Ok(metadata) = std::fs::metadata(&log_path) {
+                                    if let Ok(mtime) = metadata.modified() {
+                                        app.editing_file = Some((log_path.clone(), mtime));
+                                        let p_str = log_path.to_string_lossy().replace("'", "'\\''");
+                                        let cmd_str = format!("{} '{}'\r", app.config.external_editor, p_str);
+                                        let _ = app.pty_write.write_all(cmd_str.as_bytes());
+                                        let _ = app.pty_write.flush();
+                                    }
+                                }
                             }
                             ActionType::ShowSettingsModal => {
                                 app.show_settings_modal = !app.show_settings_modal;

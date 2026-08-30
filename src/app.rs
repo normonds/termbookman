@@ -114,6 +114,16 @@ pub struct App {
     // Delete Gist Confirmation
     pub show_delete_confirm: bool,
     pub gist_index_to_delete: Option<usize>,
+
+    // commands.txt sync tracking
+    pub commands_txt_path: Option<std::path::PathBuf>,
+    pub commands_txt_mtime: Option<std::time::SystemTime>,
+    pub commands_txt_changed: bool,
+
+    // GitHub sync status notification
+    pub github_status_msg: Option<String>,
+    pub github_status_is_error: bool,
+    pub github_status_until: Option<std::time::Instant>,
 }
 
 fn check_update_disabled() -> Option<String> {
@@ -190,6 +200,7 @@ pub fn load_commands(
         let _ = std::fs::create_dir_all(&config_dir);
     }
     let cmd_path = config_dir.join("commands.txt");
+    log_debug(&format!("Loading commands.txt from: {:?}", cmd_path));
     if !cmd_path.exists() {
         let _ = std::fs::write(&cmd_path, DEFAULT_COMMANDS);
     }
@@ -275,6 +286,12 @@ pub fn load_commands(
 }
 
 impl App {
+    pub fn set_github_status(&mut self, msg: impl Into<String>, is_error: bool, secs: u64) {
+        self.github_status_msg = Some(msg.into());
+        self.github_status_is_error = is_error;
+        self.github_status_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
+    }
+
     pub fn is_item_visible(&self, item: &StatusBarItem) -> bool {
         match &item.condition {
             Some(ConditionType::HasGit) => self.git_info.is_some(),
@@ -407,6 +424,20 @@ impl App {
             show_delete_confirm: false,
             gist_index_to_delete: None,
             update_disabled_reason: check_update_disabled(),
+            commands_txt_path: {
+                let config_dir = get_config_dir();
+                config_dir.map(|d| d.join("commands.txt"))
+            },
+            commands_txt_mtime: {
+                let config_dir = get_config_dir();
+                config_dir
+                    .map(|d| d.join("commands.txt"))
+                    .and_then(|p| std::fs::metadata(&p).and_then(|m| m.modified()).ok())
+            },
+            commands_txt_changed: false,
+            github_status_msg: None,
+            github_status_is_error: false,
+            github_status_until: None,
         }
     }
 
@@ -464,6 +495,14 @@ impl App {
     }
 
     pub fn update_stats(&mut self, sys: &mut System) -> Option<std::path::PathBuf> {
+        // Clear expired github status notifications
+        if let Some(until) = self.github_status_until {
+            if std::time::Instant::now() >= until {
+                self.github_status_msg = None;
+                self.github_status_until = None;
+            }
+        }
+
         sys.refresh_cpu();
         sys.refresh_memory();
         sys.refresh_processes();
@@ -539,7 +578,7 @@ impl App {
                                     self.sidebar_infos = i;
                                     self.sidebar_mtimes = m;
                                     self.sidebar_paths = p;
-                                } else {
+                                } else if path.file_name() == Some(std::ffi::OsStr::new("commands.txt")) {
                                     // Local command file (commands.txt) modified, reload
                                     log_debug("Local commands modified, reloading...");
                                     let exe_path = std::env::current_exe().unwrap_or_default();
@@ -560,6 +599,17 @@ impl App {
             }
         }
         self.last_pty_busy = self.is_pty_busy;
+
+        // Check if commands.txt was modified externally and signal for Gist sync
+        if let Some(ref cmd_path) = self.commands_txt_path.clone() {
+            if let Ok(new_mtime) = std::fs::metadata(cmd_path).and_then(|m| m.modified()) {
+                if Some(new_mtime) != self.commands_txt_mtime {
+                    log_debug("commands.txt modified, flagging for Gist sync...");
+                    self.commands_txt_mtime = Some(new_mtime);
+                    self.commands_txt_changed = true;
+                }
+            }
+        }
 
         // Only refresh git info every ~2 seconds (40 * 50ms) to save CPU
         static mut GIT_COUNTER: u32 = 0;

@@ -65,6 +65,9 @@ pub struct AuthConfig {
     pub update_url: String,
     #[serde(default)]
     pub scope: String,
+    /// Set to false in config.toml to disable auto-syncing commands.txt to a Gist on change.
+    #[serde(default = "default_sync_commands")]
+    pub sync_commands_to_gist: bool,
 }
 
 fn default_repo_url() -> String {
@@ -72,6 +75,9 @@ fn default_repo_url() -> String {
 }
 fn default_update_url() -> String {
     "https://github.com/normonds/termbookman/releases/latest/download/tbm".to_string()
+}
+fn default_sync_commands() -> bool {
+    true
 }
 
 #[derive(Deserialize, Serialize, Clone, Default)]
@@ -105,6 +111,7 @@ pub enum ItemType {
     GitInfo,
     TimeAndScroll,
     SelectedCommandInfo,
+    GithubStatus,
 }
 
 #[derive(Deserialize, Serialize, Clone, PartialEq)]
@@ -116,6 +123,7 @@ pub enum ActionType {
     Quit,
     ShowSettingsModal,
     FetchGists,
+    OpenLog,
 }
 
 #[derive(Deserialize, Serialize, Clone, PartialEq)]
@@ -216,6 +224,9 @@ condition = "has_git"
 type_ = "git_info"
 
 [[statusbar.lower]]
+type_ = "github_status"
+
+[[statusbar.lower]]
 type_ = "system_stats"
 width = 25
 
@@ -230,8 +241,8 @@ color = "magenta"
 hover_color = "light_magenta"
 
 [[statusbar.lower]]
-label = " GISTS "
-action = "fetch_gists"
+label = " LOG "
+action = "open_log"
 color = "yellow"
 hover_color = "light_yellow"
 

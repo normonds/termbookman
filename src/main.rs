@@ -301,22 +301,63 @@ fn main() -> Result<(), Box<dyn Error>> {
                             let token = token.clone();
                             let display_name = remote_name.clone();
                             std::thread::spawn(move || {
+                                log_debug(&format!("Auto-uploading Gist: {}", display_name));
                                 let _ = tx.send(Message::GistUploadStatus(
                                     format!("[Auto-Uploading Gist: {}]", display_name),
                                     true,
                                 ));
                                 if let Err(e) = github::upload_gist(&token, &path, &remote_name) {
+                                    log_debug(&format!("✗ Auto-upload failed: {}", e));
                                     let _ = tx.send(Message::GistUploadStatus(
                                         format!("✗ Auto-upload failed: {}", e),
                                         false,
                                     ));
                                 } else {
+                                    log_debug(&format!("✓ Auto-upload success: {}", display_name));
                                     let _ = tx.send(Message::GistUploadStatus(
                                         format!("✓ Auto-upload success: {}", display_name),
                                         true,
                                     ));
                                 }
                             });
+                        }
+                    }
+                }
+
+                // Sync commands.txt to Gist on change
+                if app.commands_txt_changed {
+                    app.commands_txt_changed = false;
+                    if app.config.auth.sync_commands_to_gist {
+                        if let Some(token) = app.auth_token.clone() {
+                            if let Some(cmd_path) = app.commands_txt_path.clone() {
+                                let tx2 = tx.clone();
+                                std::thread::spawn(move || {
+                                    log_debug("Auto-uploading commands.txt to Gist...");
+                                    let _ = tx2.send(Message::GistUploadStatus(
+                                        "Auto-uploading commands.txt to Gist...".to_string(),
+                                        true,
+                                    ));
+                                    match github::upload_gist(&token, &cmd_path, "commands.txt") {
+                                        Ok(_) => {
+                                            log_debug("commands.txt synced to Gist successfully");
+                                            let _ = tx2.send(Message::GistUploadStatus(
+                                                "✓ commands.txt synced to Gist".to_string(),
+                                                true,
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            log_debug(&format!(
+                                                "✗ commands.txt Gist sync failed: {}",
+                                                e
+                                            ));
+                                            let _ = tx2.send(Message::GistUploadStatus(
+                                                format!("✗ commands.txt sync failed: {}", e),
+                                                false,
+                                            ));
+                                        }
+                                    }
+                                });
+                            }
                         }
                     }
                 }
@@ -383,11 +424,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                 app.login_error = None;
             }
             Message::AuthError(err) => {
+                log_debug(&format!("✗ GitHub/Gist Error: {}", err));
+                app.loading_gist = false;
+                app.set_github_status(format!("✗ Gist fetch failed: {}", err), true, 8);
                 app.login_error = Some(err);
             }
             Message::FetchGists => {
-                log_debug("Message::FetchGists received");
+                log_debug("Fetching gists from GitHub...");
                 app.loading_gist = true;
+                app.set_github_status("⟳ Fetching gists...", false, 30);
                 if let Some(token) = &app.auth_token {
                     let tx = tx.clone();
                     let token = token.clone();
@@ -559,20 +604,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                     app.gist_remote_names.remove(idx);
 
                     // Delete from GitHub if token is available
-                    if let Some(token) = token_opt {
+                     if let Some(token) = token_opt {
                         std::thread::spawn(move || {
+                            log_debug(&format!("Deleting Gist: {}", remote_name));
                             let _ = tx.send(Message::GistUploadStatus(
                                 format!("[Deleting Gist: {}]", remote_name),
                                 true,
                             ));
                             match crate::github::delete_gist(&token, &remote_name) {
                                 Ok(_) => {
+                                    log_debug(&format!("✓ Gist deleted successfully: {}", remote_name));
                                     let _ = tx.send(Message::GistUploadStatus(
                                         format!("✓ Gist deleted: {}", remote_name),
                                         true,
                                     ));
                                 }
                                 Err(e) => {
+                                    log_debug(&format!("✗ Gist deletion failed: {}", e));
                                     let _ = tx.send(Message::GistUploadStatus(
                                         format!("✗ Gist deletion failed: {}", e),
                                         false,
@@ -605,6 +653,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 };
                 let path = gist_dir.join(&filename);
                 let content = "#!/bin/bash\n# IDENTIFIER description tags\n\necho 'Hello World'\n";
+                log_debug(&format!("Creating script gist locally: {:?}", path));
                 if let Ok(_) = std::fs::write(&path, content) {
                     if let Ok(metadata) = std::fs::metadata(&path) {
                         if let Ok(mtime) = metadata.modified() {
@@ -739,7 +788,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 });
             }
             Message::GistsFetched(gists) => {
+                log_debug(&format!("Gists fetched successfully: {} items", gists.len()));
                 app.loading_gist = false;
+                app.set_github_status("✓ Gists loaded", false, 3);
                 app.gist_items.clear();
                 app.gist_infos.clear();
                 app.gist_commands.clear();
@@ -757,12 +808,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 app.sidebar_mode = app::SidebarMode::Gists;
                 app.sidebar_state.select(Some(0));
             }
-            Message::GistUploadStatus(msg, _is_success) => {
-                // Use echo to safely output the message through the shell
-                let escaped = msg.replace("'", "'\"'\"'");
-                let echo_cmd = format!("echo '{}'\r", escaped);
-                let _ = app.pty_write.write_all(echo_cmd.as_bytes());
-                let _ = app.pty_write.flush();
+            Message::GistUploadStatus(msg, is_success) => {
+                let secs = if is_success { 4 } else { 8 };
+                app.set_github_status(&msg, !is_success, secs);
             }
             Message::Event(event) => {
                 match event {
