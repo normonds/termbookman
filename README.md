@@ -31,7 +31,7 @@ Coded mostly by Google's Gemini 3
 -   **Framework**: [Ratatui](https://github.com/ratatui/ratatui) + `crossterm`.
 -   **PTY Bridge**: `portable-pty`.
 -   **Terminal Parser**: A locally maintained patch of `vt100` for box-drawing character integrity.
--   **Async Core**: Powered by `tokio` for efficient event loop and I/O handling.
+-   **Event Loop**: Plain threads (PTY reader, input, timer, network jobs) feeding one `std::sync::mpsc` channel.
 
 ## 📦 Installation
 
@@ -56,12 +56,32 @@ Settings are managed in `~/.config/termbookman/config.toml`. The application wil
 -   UI color schemes for the terminal and status bars.
 -   GitHub authentication (Device Flow or PAT).
 -   Customizable status bar items and actions.
+-   `sync_commands_to_gist` (off by default): upload `commands.txt` to a private Gist whenever it changes.
+
+`config.toml` stores the GitHub token and is written with owner-only permissions. The same directory holds `commands.txt`, the gist cache (`gists/<gist id>/<file>`) and `debug.log`. Set `TERMBOOKMAN_CONFIG_DIR` to use a different directory.
+
+Fetching gists never overwrites local edits that were not uploaded yet; such files are listed in the status bar. Deleting a script removes only that file from its Gist (the Gist itself is deleted only when the file was its last one).
+
+The in-app updater only installs a release binary whose `.sha256` checksum (published by CI next to each binary) matches.
+
+## 🖥 Command Line
+
+```bash
+termbookman <label>             # run a command or script by its sidebar label
+termbookman script <label>      # run a script entry
+termbookman print <label>       # print a command
+termbookman print script <label># print a script's source
+termbookman run <file> <key>    # run the entry <key> from <file> (used by the sidebar)
+termbookman exec '<cmd>'        # run a command, asking for its <prompt:Label:Default> values
+termbookman --version
+```
 
 ## ⌨️ Controls
 
 -   **Mouse**: Click tabs, sidebar items, and modal buttons. Scroll terminal or sidebar.
 -   **Ctrl-C**: Send interrupt to the active PTY process.
 -   **Shift-PageUp / Shift-PageDown**: Scroll terminal history.
+-   **Shift + mouse**: Select text even when the running program captures the mouse; **Ctrl-Shift-C** copies it.
 -   **Settings Button**: Open the configuration modal to manage GitHub tokens and editor settings.
 
 ## 📄 License

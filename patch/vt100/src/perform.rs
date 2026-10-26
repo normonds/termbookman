@@ -97,7 +97,13 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                 b'=' => self.screen.deckpam(),
                 b'>' => self.screen.deckpnm(),
                 b'M' => self.screen.ri(),
-                b'c' => self.screen.ris(),
+                b'c' => {
+                    // A full reset also selects the ASCII character sets again.
+                    self.g0_is_acs = false;
+                    self.g1_is_acs = false;
+                    self.shift_out = false;
+                    self.screen.ris();
+                }
                 b'g' => self.callbacks.visual_bell(&mut self.screen),
                 _ => {
                     self.callbacks.unhandled_escape(

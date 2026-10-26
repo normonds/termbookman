@@ -1,131 +1,177 @@
-use crate::app::{App, Message, SidebarMode};
-use crate::config::{ActionType, ItemType};
-use crate::github::upload_gist;
-use crate::ui::{calculate_layout, modals};
-use crate::utils::log_debug;
-use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crate::app::{is_deletable, App, Message, SidebarMode};
+use crate::config::ActionType;
+use crate::entry::{Entry, EntryKind};
+use crate::input::{encode_mouse, key_to_bytes};
+use crate::ui::{calculate_layout, modals, statusbar};
+use crate::utils::{log_debug, shell_quote};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use std::io::Write;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use vt100::{MouseProtocolEncoding, MouseProtocolMode};
+use vt100::MouseProtocolMode;
+
+fn write_pty(app: &mut App, bytes: &[u8]) {
+    let _ = app.pty_write.write_all(bytes);
+    let _ = app.pty_write.flush();
+}
+
+fn exe_word() -> String {
+    let exe = std::env::current_exe().unwrap_or_default();
+    shell_quote(&exe.to_string_lossy())
+}
+
+/// The shell line that runs a sidebar entry. Entries from files are referenced by file and key,
+/// so the command run is exactly the one shown, whatever labels other sources produce.
+pub fn run_line(entry: &Entry) -> String {
+    match (&entry.kind, &entry.path) {
+        (EntryKind::History, _) => format!("{}\r", entry.command),
+        (_, Some(path)) => format!(
+            "{} run {} {}\r",
+            exe_word(),
+            shell_quote(&path.to_string_lossy()),
+            shell_quote(&entry.key)
+        ),
+        (_, None) => format!("{} {}\r", exe_word(), shell_quote(&entry.label)),
+    }
+}
+
+/// The shell line for a status bar `send_command`. Commands with `<prompt:...>` tags go through
+/// `termbookman exec` so the prompts are asked interactively inside the terminal.
+pub fn send_command_line(cmd: &str) -> String {
+    if !cmd.contains("<prompt:") {
+        return cmd.to_string();
+    }
+    let body = cmd.trim_end_matches(['\r', '\n']);
+    format!("{} exec {}\r", exe_word(), shell_quote(body))
+}
+
+pub fn open_in_editor(app: &mut App, path: &std::path::Path) {
+    let cmd = format!(
+        "{} {}\r",
+        app.config.external_editor,
+        shell_quote(&path.to_string_lossy())
+    );
+    write_pty(app, cmd.as_bytes());
+}
+
+/// Starts the GitHub device login unless one is already running.
+pub fn start_device_flow(app: &mut App, tx: &mpsc::Sender<Message>) {
+    let Some(client_id) = app.config.auth.github_client_id.clone() else {
+        app.login_error = Some("No github_client_id found in config.".to_string());
+        return;
+    };
+    if app.device_flow_running {
+        return;
+    }
+    app.device_flow_running = true;
+    app.device_flow_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    app.login_error = Some("Fetching GitHub code...".to_string());
+    let scope = app.config.auth.scope.clone();
+    let tx = tx.clone();
+    std::thread::spawn(move || match crate::github::request_device_code(&client_id, &scope) {
+        Ok(code) => {
+            let _ = tx.send(Message::DeviceCodeSuccess(code));
+        }
+        Err(e) => {
+            log_debug(&format!("GitHub auth error: {}", e));
+            let _ = tx.send(Message::AuthError(e));
+            let _ = tx.send(Message::DeviceFlowFinished);
+        }
+    });
+}
+
+/// Keys pressed while the menu modal is open.
+pub fn handle_menu_key(app: &mut App, key: &KeyEvent) {
+    match key.code {
+        KeyCode::Char('b') => write_pty(app, b"btop\r"),
+        KeyCode::Char('s') => write_pty(app, b"df -h\r"),
+        _ => {}
+    }
+    app.show_menu = false;
+}
+
+/// Forwards a key press to the PTY.
+pub fn forward_key(app: &mut App, key: &KeyEvent) {
+    let app_cursor = {
+        let mut p = app.parser.lock().unwrap();
+        p.screen_mut().set_scrollback(0);
+        p.screen().application_cursor()
+    };
+    if let Some(bytes) = key_to_bytes(key, app_cursor) {
+        write_pty(app, &bytes);
+    }
+}
+
+fn select_by_scrollbar(app: &mut App, row: u16, track: Rect) {
+    let count = app.filtered_indices().len();
+    if track.height == 0 || count == 0 {
+        return;
+    }
+    let row = row.clamp(track.y, track.bottom().saturating_sub(1));
+    let pos = (row - track.y) as f32 / track.height as f32;
+    let visual_idx = ((count as f32 * pos) as usize).min(count - 1);
+    app.sidebar_state.select(Some(visual_idx));
+}
+
+fn scrollback_from_track(app: &mut App, row: u16, track: Rect) {
+    // The first and last rows of the scrollbar are the arrow buttons.
+    let inner_y = track.y + 1;
+    let inner_h = track.height.saturating_sub(2);
+    if inner_h == 0 {
+        return;
+    }
+    let row = row.clamp(inner_y, inner_y + inner_h - 1);
+    let mut p = app.parser.lock().unwrap();
+    let history_len = p.screen().scrollback_len() as f32;
+    let pos = (row - inner_y) as f32 / inner_h.saturating_sub(1).max(1) as f32;
+    p.screen_mut()
+        .set_scrollback((history_len * (1.0 - pos)).round() as usize);
+}
+
+fn scroll_terminal(app: &mut App, lines: isize) {
+    let mut p = app.parser.lock().unwrap();
+    let current = p.screen().scrollback() as isize;
+    p.screen_mut()
+        .set_scrollback((current + lines).max(0) as usize);
+}
 
 pub fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sender<Message>) {
     let layout = calculate_layout(size, app.sidebar_width);
+    let pos = Position::new(mouse.column, mouse.row);
+    let left_down = mouse.kind == MouseEventKind::Down(MouseButton::Left);
 
     if app.show_delete_confirm {
         let area = modals::centered_rect_fixed(50, 10, size);
-        if area.contains(Position::new(mouse.column, mouse.row)) {
-            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-                let block =
-                    ratatui::widgets::Block::default().borders(ratatui::widgets::Borders::ALL);
-                let inner = block.inner(area);
+        if area.contains(pos) && left_down {
+            let inner = ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::ALL)
+                .inner(area);
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1), // warning
+                    Constraint::Length(2), // name
+                    Constraint::Length(1), // spacer
+                    Constraint::Length(1), // buttons
+                    Constraint::Min(0),
+                ])
+                .split(inner);
 
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(1), // warning
-                        Constraint::Length(2), // name
-                        Constraint::Length(1), // spacer
-                        Constraint::Length(1), // buttons
-                        Constraint::Min(0),
-                    ])
-                    .split(inner);
+            if chunks[3].contains(pos) {
+                let button_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(chunks[3]);
 
-                if chunks[3].contains(Position::new(mouse.column, mouse.row)) {
-                    let button_chunks = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                        .split(chunks[3]);
-
-                    if button_chunks[0].contains(Position::new(mouse.column, mouse.row)) {
-                        // Clicked [Y]
-                        if let Some(idx) = app.gist_index_to_delete {
-                            let _ = tx.send(Message::DeleteGist(idx));
-                        }
-                        app.show_delete_confirm = false;
-                        app.gist_index_to_delete = None;
-                    } else if button_chunks[1].contains(Position::new(mouse.column, mouse.row)) {
-                        // Clicked [N]
-                        app.show_delete_confirm = false;
-                        app.gist_index_to_delete = None;
+                if button_chunks[0].contains(pos) {
+                    if let Some(path) = app.gist_to_delete.take() {
+                        let _ = tx.send(Message::DeleteGist(path));
                     }
-                }
-            }
-        }
-        return;
-    }
-
-    if app.show_upload_confirm {
-        let area = modals::centered_rect_fixed(50, 10, size);
-        if area.contains(Position::new(mouse.column, mouse.row)) {
-            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-                let block =
-                    ratatui::widgets::Block::default().borders(ratatui::widgets::Borders::ALL);
-                let inner = block.inner(area);
-
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(1), // filename
-                        Constraint::Length(2), // question
-                        Constraint::Length(1), // spacer
-                        Constraint::Length(1), // choices
-                        Constraint::Min(0),
-                    ])
-                    .split(inner);
-
-                if chunks[3].contains(Position::new(mouse.column, mouse.row)) {
-                    let choices_chunks = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                        .split(chunks[3]);
-
-                    if choices_chunks[0].contains(Position::new(mouse.column, mouse.row)) {
-                        // Clicked [Y]
-                        if let (Some(path), Some(token)) =
-                            (app.pending_gist_file.take(), app.auth_token.clone())
-                        {
-                            let mut remote_name = None;
-                            for (i, p) in app.gist_paths.iter().enumerate() {
-                                if let Some(p) = p {
-                                    if p == &path {
-                                        remote_name = Some(app.gist_remote_names[i].clone());
-                                        break;
-                                    }
-                                }
-                            }
-                            if let Some(remote_name) = remote_name {
-                                let tx = tx.clone();
-                                let display_name = remote_name.clone();
-                                std::thread::spawn(move || {
-                                    log_debug(&format!("Uploading Gist manually: {}", display_name));
-                                    let _ = tx.send(Message::GistUploadStatus(
-                                        format!("[Uploading Gist: {}]", display_name),
-                                        true,
-                                    ));
-                                    if let Err(e) = upload_gist(&token, &path, &remote_name) {
-                                        log_debug(&format!("✗ Gist upload failed: {}", e));
-                                        let _ = tx.send(Message::GistUploadStatus(
-                                            format!("✗ Gist upload failed: {}", e),
-                                            false,
-                                        ));
-                                    } else {
-                                        log_debug(&format!("✓ Gist updated: {}", display_name));
-                                        let _ = tx.send(Message::GistUploadStatus(
-                                            format!("✓ Gist updated: {}", display_name),
-                                            true,
-                                        ));
-                                    }
-                                });
-                            }
-                        }
-                        app.show_upload_confirm = false;
-                    } else if choices_chunks[1].contains(Position::new(mouse.column, mouse.row)) {
-                        // Clicked [N]
-                        app.show_upload_confirm = false;
-                        app.pending_gist_file = None;
-                    }
+                    app.show_delete_confirm = false;
+                } else if button_chunks[1].contains(pos) {
+                    app.show_delete_confirm = false;
+                    app.gist_to_delete = None;
                 }
             }
         }
@@ -134,9 +180,10 @@ pub fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sen
 
     if app.show_settings_modal {
         let area = modals::centered_rect_fixed(100, 26, size);
-        if area.contains(Position::new(mouse.column, mouse.row)) {
-            let block = ratatui::widgets::Block::default().borders(ratatui::widgets::Borders::ALL);
-            let inner_area = block.inner(area);
+        if area.contains(pos) {
+            let inner_area = ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::ALL)
+                .inner(area);
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .margin(1)
@@ -149,7 +196,7 @@ pub fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sen
                     Constraint::Length(1), // Spacer
                     Constraint::Length(1), // Update URL Header
                     Constraint::Length(3), // Update URL Input
-                    Constraint::Length(1), // Update Warning (new)
+                    Constraint::Length(1), // Update Warning
                     Constraint::Length(1), // Update Button
                     Constraint::Length(1), // Spacer
                     Constraint::Length(1), // Editor Header
@@ -158,93 +205,74 @@ pub fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sen
                 ])
                 .split(inner_area);
 
-            if chunks[3].contains(Position::new(mouse.column, mouse.row)) {
-                if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-                    app.is_pat_focused = true;
-                    app.is_update_url_focused = false;
-                    app.is_editor_focused = false;
+            let focus = |app: &mut App, pat: bool, url: bool, editor: bool| {
+                app.is_pat_focused = pat;
+                app.is_update_url_focused = url;
+                app.is_editor_focused = editor;
+            };
+            if chunks[3].contains(pos) {
+                if left_down {
+                    focus(app, true, false, false);
                 }
                 return;
             }
-            if chunks[7].contains(Position::new(mouse.column, mouse.row)) {
-                if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-                    app.is_update_url_focused = true;
-                    app.is_pat_focused = false;
-                    app.is_editor_focused = false;
+            if chunks[7].contains(pos) {
+                if left_down {
+                    focus(app, false, true, false);
                 }
                 return;
             }
-            if chunks[9].contains(Position::new(mouse.column, mouse.row)) {
-                if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-                    // Only allow update if not disabled
-                    if app.update_disabled_reason.is_none() {
-                        let _ = tx.send(Message::UpdateBinary);
-                    }
+            if chunks[9].contains(pos) {
+                if left_down && app.update_disabled_reason.is_none() {
+                    let _ = tx.send(Message::UpdateBinary);
                 }
                 return;
             }
-            if chunks[12].contains(Position::new(mouse.column, mouse.row)) {
-                if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-                    app.is_editor_focused = true;
-                    app.is_pat_focused = false;
-                    app.is_update_url_focused = false;
+            if chunks[12].contains(pos) {
+                if left_down {
+                    focus(app, false, false, true);
                 }
                 return;
             }
         }
-        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+        if left_down {
             app.is_pat_focused = false;
             app.is_update_url_focused = false;
             app.is_editor_focused = false;
-            if !area.contains(Position::new(mouse.column, mouse.row)) {
+            if !area.contains(pos) {
                 app.show_settings_modal = false;
             }
         }
         return;
     }
 
-    let (mouse_mode, mouse_enc) = {
+    let (mouse_mode, mouse_enc, alt_screen, app_cursor) = {
         let parser = app.parser.lock().unwrap();
         let screen = parser.screen();
         (
             screen.mouse_protocol_mode(),
             screen.mouse_protocol_encoding(),
+            screen.alternate_screen(),
+            screen.application_cursor(),
         )
     };
 
-    if layout
-        .term_area
-        .contains(Position::new(mouse.column, mouse.row))
+    // Programs that enabled mouse reporting get the events; Shift bypasses this so text can
+    // still be selected locally, as in xterm.
+    let in_term = layout.term_area.contains(pos);
+    if in_term
         && mouse_mode != MouseProtocolMode::None
+        && !mouse.modifiers.contains(KeyModifiers::SHIFT)
+        && !app.is_selecting
     {
-        let tx = (mouse.column.saturating_sub(layout.term_area.x) + 1) as i32;
-        let ty = (mouse.row.saturating_sub(layout.term_area.y) + 1) as i32;
-
-        let btn = match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => 0,
-            MouseEventKind::Down(MouseButton::Middle) => 1,
-            MouseEventKind::Down(MouseButton::Right) => 2,
-            MouseEventKind::Up(MouseButton::Left) => 0,
-            MouseEventKind::Up(MouseButton::Middle) => 1,
-            MouseEventKind::Up(MouseButton::Right) => 2,
-            MouseEventKind::Drag(MouseButton::Left) => 32,
-            MouseEventKind::Drag(MouseButton::Middle) => 33,
-            MouseEventKind::Drag(MouseButton::Right) => 34,
-            MouseEventKind::Moved => 35,
-            MouseEventKind::ScrollUp => 64,
-            MouseEventKind::ScrollDown => 65,
-            _ => 0,
-        };
-
-        let is_up = matches!(mouse.kind, MouseEventKind::Up(_));
-        let suffix = if is_up { 'm' } else { 'M' };
-
-        if mouse_enc == MouseProtocolEncoding::Sgr {
-            let seq = format!("\x1b[<{};{};{}{}", btn, tx, ty, suffix);
-            let _ = app.pty_write.write_all(seq.as_bytes());
-            let _ = app.pty_write.flush();
-            return;
+        let col = mouse.column - layout.term_area.x + 1;
+        let row = mouse.row - layout.term_area.y + 1;
+        if let Some(bytes) =
+            encode_mouse(mouse.kind, mouse.modifiers, col, row, mouse_mode, mouse_enc)
+        {
+            write_pty(app, &bytes);
         }
+        return;
     }
 
     if let MouseEventKind::Up(MouseButton::Left) = mouse.kind {
@@ -254,679 +282,311 @@ pub fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sen
     }
 
     if app.is_dragging_term_scrollbar {
-        let mut p = app.parser.lock().unwrap();
-        let screen = p.screen();
-        let history_len = screen.scrollback_len();
-        if history_len > 0 {
-            let relative_y = mouse.row.saturating_sub(layout.scrollbar_area.y) as f32;
-            let percent = relative_y / layout.scrollbar_area.height as f32;
-            let new_pos = (percent * history_len as f32) as usize;
-            let target_offset = history_len.saturating_sub(new_pos);
-            p.screen_mut().set_scrollback(target_offset);
-        }
+        scrollback_from_track(app, mouse.row, layout.scrollbar_area);
         return;
     }
 
     if app.is_dragging_sidebar {
         let new_width = size.width.saturating_sub(mouse.column);
-        app.sidebar_width = new_width.clamp(10, size.width.saturating_sub(20));
+        app.sidebar_width = new_width.clamp(10, size.width.saturating_sub(20).max(10));
         return;
     }
 
-    if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-        if layout
-            .scrollbar_area
-            .contains(Position::new(mouse.column, mouse.row))
-        {
-            if mouse.modifiers.contains(KeyModifiers::CONTROL) {
-                app.is_dragging_sidebar = true;
-            } else {
-                app.is_dragging_term_scrollbar = true;
-            }
-            return;
+    if left_down && layout.scrollbar_area.contains(pos) {
+        let track = layout.scrollbar_area;
+        if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+            app.is_dragging_sidebar = true;
+        } else if mouse.row == track.y {
+            scroll_terminal(app, 3);
+        } else if mouse.row + 1 == track.bottom() {
+            scroll_terminal(app, -3);
+        } else {
+            app.is_dragging_term_scrollbar = true;
+            scrollback_from_track(app, mouse.row, track);
         }
+        return;
     }
 
-    if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-        let bars = vec![
+    if left_down {
+        let bars = [
             (app.config.statusbar.upper.clone(), layout.status_chunks[0]),
             (app.config.statusbar.lower.clone(), layout.status_chunks[1]),
         ];
-
         for (bar_items, bar_chunk) in bars {
-            let mut constraints = Vec::new();
-            let mut visible_items = Vec::new();
-
-            for item in bar_items {
-                if app.is_item_visible(&item) {
-                    let width = if let Some(w) = item.width {
-                        Constraint::Length(w)
-                    } else if item.type_ == ItemType::Spacer
-                        || item.type_ == ItemType::GitInfo
-                        || item.type_ == ItemType::SelectedCommandInfo
-                    {
-                        Constraint::Fill(1)
-                    } else if let Some(label) = &item.label {
-                        Constraint::Length(label.len() as u16)
-                    } else {
-                        Constraint::Min(0)
-                    };
-                    constraints.push(width);
-                    visible_items.push(item);
+            for (item, chunk) in statusbar::bar_layout(app, &bar_items, bar_chunk) {
+                if !chunk.contains(pos) {
+                    continue;
                 }
-            }
-
-            let chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(constraints)
-                .split(bar_chunk);
-
-            for (i, item) in visible_items.into_iter().enumerate() {
-                let chunk = chunks[i];
-                if chunk.contains(Position::new(mouse.column, mouse.row)) {
-                    if let Some(action) = item.action {
-                        match action {
-                            ActionType::ToggleMenu => {
-                                app.show_menu = !app.show_menu;
-                            }
-                            ActionType::CopySelection => {
-                                app.copy_selection();
-                            }
-                            ActionType::SendCommand => {
-                                if let Some(cmd) = item.command {
-                                    let mut final_cmd = cmd.clone();
-                                    app.process_prompt(&mut final_cmd);
-                                    let _ = app.pty_write.write_all(final_cmd.as_bytes());
-                                    let _ = app.pty_write.flush();
-                                }
-                            }
-                            ActionType::Quit => {
-                                app.should_quit = true;
-                            }
-                            ActionType::OpenLog => {
-                                let log_path = std::env::current_dir().unwrap_or_default().join("debug.log");
-                                if !log_path.exists() {
-                                    let _ = std::fs::write(&log_path, "");
-                                }
-                                if let Ok(metadata) = std::fs::metadata(&log_path) {
-                                    if let Ok(mtime) = metadata.modified() {
-                                        app.editing_file = Some((log_path.clone(), mtime));
-                                        let p_str = log_path.to_string_lossy().replace("'", "'\\''");
-                                        let cmd_str = format!("{} '{}'\r", app.config.external_editor, p_str);
-                                        let _ = app.pty_write.write_all(cmd_str.as_bytes());
-                                        let _ = app.pty_write.flush();
-                                    }
-                                }
-                            }
-                            ActionType::ShowSettingsModal => {
-                                app.show_settings_modal = !app.show_settings_modal;
-                                if app.show_settings_modal {
-                                    app.editor_input = app.config.external_editor.clone();
-                                    if let Some(token) = &app.auth_token {
-                                        app.pat_input = token.clone();
-                                    } else if let Some(client_id) =
-                                        &app.config.auth.github_client_id
-                                    {
-                                        app.login_error =
-                                            Some("Fetching GitHub code...".to_string());
-                                        let client_id = client_id.clone();
-                                        let scope = app.config.auth.scope.clone();
-                                        let tx = tx.clone();
-                                        std::thread::spawn(move || {
-                                            let url = "https://github.com/login/device/code";
-                                            let client = reqwest::blocking::Client::new();
-                                            let mut params =
-                                                vec![("client_id", client_id.as_str())];
-                                            if !scope.is_empty() {
-                                                params.push(("scope", scope.as_str()));
-                                            }
-                                            match client
-                                                .post(url)
-                                                .header("Accept", "application/json")
-                                                .query(&params)
-                                                .send()
-                                            {
-                                                Ok(res) => {
-                                                    let status = res.status();
-                                                    if let Ok(json) =
-                                                        res.json::<serde_json::Value>()
-                                                    {
-                                                        if let (
-                                                            Some(device),
-                                                            Some(user),
-                                                            Some(uri),
-                                                        ) = (
-                                                            json["device_code"].as_str(),
-                                                            json["user_code"].as_str(),
-                                                            json["verification_uri"].as_str(),
-                                                        ) {
-                                                            let _ = tx.send(
-                                                                Message::DeviceCodeSuccess(
-                                                                    device.to_string(),
-                                                                    user.to_string(),
-                                                                    uri.to_string(),
-                                                                ),
-                                                            );
-                                                            return;
-                                                        }
-                                                        if let Some(error) = json["error"].as_str()
-                                                        {
-                                                            let desc = json["error_description"]
-                                                                .as_str()
-                                                                .unwrap_or(error);
-                                                            let _ = tx.send(Message::AuthError(
-                                                                format!("GitHub: {}", desc),
-                                                            ));
-                                                            log_debug(&format!(
-                                                                "GitHub auth error: {} - {}",
-                                                                error, desc
-                                                            ));
-                                                            return;
-                                                        }
-                                                        log_debug(&format!("Failed to parse GitHub JSON (status {}): {}", status, json));
-                                                    } else {
-                                                        log_debug(&format!("Failed to parse GitHub response as JSON (status {})", status));
-                                                    }
-                                                    let _ = tx.send(Message::AuthError(format!(
-                                                        "Failed to parse device code (Status: {})",
-                                                        status
-                                                    )));
-                                                }
-                                                Err(_) => {
-                                                    let _ = tx.send(Message::AuthError(
-                                                        "Network error fetching code.".to_string(),
-                                                    ));
-                                                }
-                                            }
-                                        });
-                                    } else {
-                                        app.login_error = Some(
-                                            "No github_client_id found in config.".to_string(),
-                                        );
-                                    }
-                                }
-                            }
-                            ActionType::FetchGists => {
-                                let _ = tx.send(Message::FetchGists);
+                let Some(action) = item.action else {
+                    continue;
+                };
+                match action {
+                    ActionType::ToggleMenu => app.show_menu = !app.show_menu,
+                    ActionType::CopySelection => app.copy_selection(),
+                    ActionType::SendCommand => {
+                        if let Some(cmd) = item.command {
+                            let line = send_command_line(&cmd);
+                            write_pty(app, line.as_bytes());
+                        }
+                    }
+                    ActionType::Quit => app.should_quit = true,
+                    ActionType::OpenLog => {
+                        let log_path = crate::utils::log_path();
+                        if !log_path.exists() {
+                            log_debug("Log opened");
+                        }
+                        open_in_editor(app, &log_path);
+                    }
+                    ActionType::ShowSettingsModal => {
+                        app.show_settings_modal = !app.show_settings_modal;
+                        if app.show_settings_modal {
+                            app.editor_input = app.config.external_editor.clone();
+                            if let Some(token) = &app.auth_token {
+                                app.pat_input = token.clone();
+                            } else {
+                                start_device_flow(app, tx);
                             }
                         }
                     }
+                    ActionType::FetchGists => {
+                        let _ = tx.send(Message::FetchGists);
+                    }
                 }
+                return;
             }
         }
     }
 
-    let is_app_active = {
+    let is_app_active = alt_screen || app_cursor || {
         let parser = app.parser.lock().unwrap();
-        let screen = parser.screen();
-        screen.alternate_screen() || screen.hide_cursor() || screen.application_cursor()
+        parser.screen().hide_cursor()
     };
     let is_sidebar_locked = is_app_active || app.is_pty_busy;
 
-    let tabs_area = Rect::new(
-        layout.sidebar_area.x,
-        layout.sidebar_area.y,
-        layout.sidebar_area.width,
-        1,
+    let sa = layout.sidebar_area;
+    let tabs_area = Rect::new(sa.x, sa.y, sa.width, 1);
+    let search_area = Rect::new(sa.x, sa.y + 1, sa.width, 1);
+    let show_new_button = app.sidebar_mode == SidebarMode::Gists && !is_sidebar_locked;
+    let list_area = Rect::new(
+        sa.x,
+        sa.y + 2,
+        sa.width,
+        sa.height.saturating_sub(if show_new_button { 3 } else { 2 }),
     );
-    let (new_button_area, search_area, list_area) =
-        if app.sidebar_mode == SidebarMode::Gists && !is_sidebar_locked {
-            (
-                Some(Rect::new(
-                    layout.sidebar_area.x,
-                    layout.sidebar_area.y + layout.sidebar_area.height.saturating_sub(1),
-                    layout.sidebar_area.width,
-                    1,
-                )),
-                Rect::new(
-                    layout.sidebar_area.x,
-                    layout.sidebar_area.y + 1,
-                    layout.sidebar_area.width,
-                    1,
-                ),
-                Rect::new(
-                    layout.sidebar_area.x,
-                    layout.sidebar_area.y + 2,
-                    layout.sidebar_area.width,
-                    layout.sidebar_area.height.saturating_sub(3),
-                ),
-            )
-        } else {
-            (
-                None,
-                Rect::new(
-                    layout.sidebar_area.x,
-                    layout.sidebar_area.y + 1,
-                    layout.sidebar_area.width,
-                    1,
-                ),
-                Rect::new(
-                    layout.sidebar_area.x,
-                    layout.sidebar_area.y + 2,
-                    layout.sidebar_area.width,
-                    layout.sidebar_area.height.saturating_sub(2),
-                ),
-            )
-        };
+    let new_button_area = show_new_button.then(|| {
+        Rect::new(sa.x, sa.y + sa.height.saturating_sub(1), sa.width, 1)
+    });
 
-    if is_sidebar_locked {
-        return;
-    }
+    if sa.contains(pos) || layout.sidebar_scrollbar_area.contains(pos) {
+        if is_sidebar_locked {
+            return;
+        }
 
-    if let Some(area) = new_button_area {
-        if area.contains(Position::new(mouse.column, mouse.row)) {
-            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-                let _ = tx.send(Message::CreateNewGist);
+        if let Some(area) = new_button_area {
+            if area.contains(pos) {
+                if left_down {
+                    let _ = tx.send(Message::CreateNewGist);
+                }
+                return;
+            }
+        }
+
+        if tabs_area.contains(pos) {
+            if left_down {
+                let tabs_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Ratio(1, 3),
+                        Constraint::Ratio(1, 3),
+                        Constraint::Ratio(1, 3),
+                    ])
+                    .split(tabs_area);
+
+                if tabs_chunks[0].contains(pos) {
+                    app.sidebar_mode = SidebarMode::Commands;
+                } else if tabs_chunks[1].contains(pos) {
+                    app.sidebar_mode = SidebarMode::History;
+                    app.refresh_history();
+                } else if tabs_chunks[2].contains(pos) {
+                    app.sidebar_mode = SidebarMode::Gists;
+                }
+                app.sidebar_state.select(Some(0));
+            }
+            return;
+        }
+
+        if search_area.contains(pos) {
+            if left_down {
+                app.is_search_focused = true;
             }
             return;
         }
     }
-
-    if tabs_area.contains(Position::new(mouse.column, mouse.row)) {
-        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-            let tabs_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Ratio(1, 3),
-                    Constraint::Ratio(1, 3),
-                    Constraint::Ratio(1, 3),
-                ])
-                .split(tabs_area);
-
-            if tabs_chunks[0].contains(Position::new(mouse.column, mouse.row)) {
-                app.sidebar_mode = SidebarMode::Commands;
-            } else if tabs_chunks[1].contains(Position::new(mouse.column, mouse.row)) {
-                app.sidebar_mode = SidebarMode::History;
-                app.refresh_history();
-            } else if tabs_chunks[2].contains(Position::new(mouse.column, mouse.row)) {
-                app.sidebar_mode = SidebarMode::Gists;
-            }
-            app.sidebar_state.select(Some(0));
-        }
-        return;
-    }
-
-    if search_area.contains(Position::new(mouse.column, mouse.row)) {
-        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-            app.is_search_focused = true;
-        }
-        return;
-    } else if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+    if left_down {
         app.is_search_focused = false;
     }
 
-    if list_area.contains(Position::new(mouse.column, mouse.row)) && !is_app_active {
-        let (items, infos, _commands) = match app.sidebar_mode {
-            SidebarMode::Commands => (
-                &app.sidebar_items,
-                Some(&app.sidebar_infos),
-                &app.sidebar_commands,
-            ),
-            SidebarMode::History => (&app.history_items, None, &app.history_commands),
-            SidebarMode::Gists => (&app.gist_items, Some(&app.gist_infos), &app.gist_commands),
-        };
+    if list_area.contains(pos) && !is_sidebar_locked {
+        handle_list_mouse(app, mouse, list_area);
+        return;
+    }
 
-        let filtered: Vec<(usize, &String)> = items
-            .iter()
-            .enumerate()
-            .filter(|(idx, label)| {
-                let matches_label = label
-                    .to_lowercase()
-                    .contains(&app.search_query.to_lowercase());
-                let matches_info = if let Some(infos) = infos {
-                    infos[*idx]
-                        .to_lowercase()
-                        .contains(&app.search_query.to_lowercase())
-                } else {
-                    false
-                };
-                matches_label || matches_info
-            })
-            .collect();
-
-        match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                let current = app.sidebar_state.selected().unwrap_or(0);
-                if current > 0 {
-                    app.sidebar_state.select(Some(current - 1));
-                }
-            }
-            MouseEventKind::ScrollDown => {
-                let current = app.sidebar_state.selected().unwrap_or(0);
-                if current + 1 < filtered.len() {
-                    app.sidebar_state.select(Some(current + 1));
-                }
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                let sidebar_y = mouse.row.saturating_sub(list_area.y);
-                let offset = app.sidebar_state.offset();
-                let index = (sidebar_y as usize).saturating_add(offset);
-
-                if index < filtered.len() {
-                    let (original_index, label) = filtered[index];
-                    let now = Instant::now();
-                    let is_double_click = if let (Some(last_time), Some(last_idx)) =
-                        (app.last_click_time, app.last_clicked_index)
-                    {
-                        now.duration_since(last_time) < Duration::from_millis(300)
-                            && last_idx == index
-                    } else {
-                        false
-                    };
-
-                    if is_double_click {
-                        app.last_click_time = None;
-                        app.last_clicked_index = None;
-
-                        let (path, cmd_str) = match app.sidebar_mode {
-                            SidebarMode::Commands => {
-                                let p = &app.sidebar_paths[original_index];
-                                (
-                                    p.clone(),
-                                    p.as_ref()
-                                        .map(|path| {
-                                            let p_str =
-                                                path.to_string_lossy().replace("'", "'\\''");
-                                            format!("{} '{}'\r", app.config.external_editor, p_str)
-                                        })
-                                        .unwrap_or_default(),
-                                )
-                            }
-                            SidebarMode::Gists => {
-                                let p = &app.gist_paths[original_index];
-                                (
-                                    p.clone(),
-                                    p.as_ref()
-                                        .map(|path| {
-                                            let p_str =
-                                                path.to_string_lossy().replace("'", "'\\''");
-                                            format!("{} '{}'\r", app.config.external_editor, p_str)
-                                        })
-                                        .unwrap_or_default(),
-                                )
-                            }
-                            SidebarMode::History => (None, String::new()),
-                        };
-
-                        if let (Some(p), _) = (&path, &cmd_str) {
-                            if let Ok(metadata) = std::fs::metadata(p) {
-                                if let Ok(mtime) = metadata.modified() {
-                                    app.editing_file = Some((p.clone(), mtime));
-                                }
-                            }
-                        }
-
-                        if !cmd_str.is_empty() {
-                            let _ = app.pty_write.write_all(cmd_str.as_bytes());
-                            let _ = app.pty_write.flush();
-                        }
-                    } else {
-                        app.sidebar_state.select(Some(index));
-                        app.last_click_time = Some(now);
-                        app.last_clicked_index = Some(index);
-
-                        let sidebar_x = mouse.column.saturating_sub(list_area.x);
-
-                        let is_script = if app.sidebar_mode == SidebarMode::Gists {
-                            app.gist_infos
-                                .get(original_index)
-                                .map(|inf| inf.starts_with("__SCRIPT__"))
-                                .unwrap_or(false)
-                        } else {
-                            app.sidebar_infos
-                                .get(original_index)
-                                .map(|inf| inf.starts_with("__SCRIPT__"))
-                                .unwrap_or(false)
-                        };
-
-                        let is_delete_click = app.sidebar_mode == SidebarMode::Gists
-                            && is_script
-                            && sidebar_x >= list_area.width.saturating_sub(4)
-                            && sidebar_x < list_area.width.saturating_sub(1);
-
-                        if is_delete_click {
-                            app.show_delete_confirm = true;
-                            app.gist_index_to_delete = Some(original_index);
-                        } else if sidebar_x <= 1 {
-                            if label.starts_with("GIST: ") && app.sidebar_mode == SidebarMode::Gists
-                            {
-                                let _ = tx.send(Message::FetchGists);
-                            } else {
-                                let cmd_str = match app.sidebar_mode {
-                                    SidebarMode::History => {
-                                        format!("{}\r", app.history_commands[original_index])
-                                    }
-                                    SidebarMode::Gists | SidebarMode::Commands => {
-                                        let (items, _, _) = match app.sidebar_mode {
-                                            SidebarMode::Commands => (
-                                                &app.sidebar_items,
-                                                Some(&app.sidebar_infos),
-                                                &app.sidebar_commands,
-                                            ),
-                                            SidebarMode::History => {
-                                                (&app.history_items, None, &app.history_commands)
-                                            }
-                                            SidebarMode::Gists => (
-                                                &app.gist_items,
-                                                Some(&app.gist_infos),
-                                                &app.gist_commands,
-                                            ),
-                                        };
-                                        let label = &items[original_index];
-                                        let exe = std::env::current_exe().unwrap_or_default();
-                                        if is_script {
-                                            format!("{} script {}\r", exe.display(), label)
-                                        } else {
-                                            format!("{} {}\r", exe.display(), label)
-                                        }
-                                    }
-                                };
-                                let _ = app.pty_write.write_all(cmd_str.as_bytes());
-                                let _ = app.pty_write.flush();
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    } else if layout
-        .sidebar_scrollbar_area
-        .contains(Position::new(mouse.column, mouse.row))
-        || app.is_dragging_sidebar_scrollbar
+    if !is_sidebar_locked
+        && (layout.sidebar_scrollbar_area.contains(pos) || app.is_dragging_sidebar_scrollbar)
     {
-        let (items, infos, _) = match app.sidebar_mode {
-            SidebarMode::Commands => (
-                &app.sidebar_items,
-                Some(&app.sidebar_infos),
-                &app.sidebar_commands,
-            ),
-            SidebarMode::History => (&app.history_items, None, &app.history_commands),
-            SidebarMode::Gists => (&app.gist_items, Some(&app.gist_infos), &app.gist_commands),
-        };
-
-        let filtered: Vec<(usize, &String)> = items
-            .iter()
-            .enumerate()
-            .filter(|(idx, label)| {
-                let matches_label = label
-                    .to_lowercase()
-                    .contains(&app.search_query.to_lowercase());
-                let matches_info = if let Some(infos) = infos {
-                    infos[*idx]
-                        .to_lowercase()
-                        .contains(&app.search_query.to_lowercase())
-                } else {
-                    false
-                };
-                matches_label || matches_info
-            })
-            .collect();
-
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 app.is_dragging_sidebar_scrollbar = true;
-                let track_height = layout.sidebar_scrollbar_area.height as f32;
-                let click_pos = (mouse.row.saturating_sub(layout.sidebar_scrollbar_area.y)) as f32;
-                if track_height > 0.0 && !filtered.is_empty() {
-                    let visual_idx = ((filtered.len() as f32 * (click_pos / track_height))
-                        as usize)
-                        .min(filtered.len() - 1);
-                    let (original_index, _) = filtered[visual_idx];
-                    app.sidebar_state.select(Some(original_index));
-                }
+                select_by_scrollbar(app, mouse.row, layout.sidebar_scrollbar_area);
             }
             MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved
                 if app.is_dragging_sidebar_scrollbar =>
             {
-                let track_height = layout.sidebar_scrollbar_area.height as f32;
-                let mouse_y = mouse.row.clamp(
-                    layout.sidebar_scrollbar_area.y,
-                    layout.sidebar_scrollbar_area.bottom().saturating_sub(1),
-                );
-                let click_pos = (mouse_y.saturating_sub(layout.sidebar_scrollbar_area.y)) as f32;
-                if track_height > 0.0 && !filtered.is_empty() {
-                    let visual_idx = ((filtered.len() as f32 * (click_pos / track_height))
-                        as usize)
-                        .min(filtered.len() - 1);
-                    let (original_index, _) = filtered[visual_idx];
-                    app.sidebar_state.select(Some(original_index));
-                }
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                app.is_dragging_sidebar_scrollbar = false;
+                select_by_scrollbar(app, mouse.row, layout.sidebar_scrollbar_area);
             }
             _ => {}
         }
-    } else if layout
-        .scrollbar_area
-        .contains(Position::new(mouse.column, mouse.row))
-        || app.is_dragging_scrollbar
-    {
+        return;
+    }
+
+    if in_term || app.is_selecting {
+        let tx_ = mouse.column.saturating_sub(layout.term_area.x);
+        let ty = mouse.row.saturating_sub(layout.term_area.y);
+        let max_col = layout.term_area.width.saturating_sub(1);
+        let max_row = layout.term_area.height.saturating_sub(1);
+        let cell = (ty.min(max_row), tx_.min(max_col));
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                app.is_dragging_scrollbar = true;
-                let mut parser = app.parser.lock().unwrap();
-                let screen = parser.screen_mut();
-                let current = screen.scrollback();
-
-                if mouse.row == layout.scrollbar_area.y {
-                    screen.set_scrollback(current + 3);
-                } else if mouse.row == layout.scrollbar_area.bottom() - 1 {
-                    screen.set_scrollback(current.saturating_sub(3));
-                } else {
-                    let track_height = layout.scrollbar_area.height.saturating_sub(2) as f32;
-                    let click_pos = (mouse.row.saturating_sub(layout.scrollbar_area.y + 1)) as f32;
-                    let history_len = screen.scrollback_len() as f32;
-                    if track_height > 0.0 {
-                        let target_scroll =
-                            (history_len * (1.0 - (click_pos / track_height))) as usize;
-                        screen.set_scrollback(target_scroll);
-                    }
-                }
+                app.is_selecting = true;
+                app.selection_start = Some(cell);
+                app.selection_end = Some(cell);
             }
             MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved
-                if app.is_dragging_scrollbar =>
+                if app.is_selecting =>
             {
-                let mut parser = app.parser.lock().unwrap();
-                let screen = parser.screen_mut();
-                let track_height = layout.scrollbar_area.height.saturating_sub(2) as f32;
-                let mouse_y = mouse.row.clamp(
-                    layout.scrollbar_area.y + 1,
-                    layout.scrollbar_area.bottom().saturating_sub(2),
-                );
-                let click_pos = (mouse_y.saturating_sub(layout.scrollbar_area.y + 1)) as f32;
-                let history_len = screen.scrollback_len() as f32;
-
-                if track_height > 0.0 {
-                    let target_scroll = (history_len * (1.0 - (click_pos / track_height))) as usize;
-                    screen.set_scrollback(target_scroll);
+                app.selection_end = Some(cell);
+            }
+            MouseEventKind::Up(MouseButton::Left) if app.is_selecting => {
+                app.is_selecting = false;
+                if app.selection_start == app.selection_end {
+                    app.selection_start = None;
+                    app.selection_end = None;
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) => {
-                app.is_dragging_scrollbar = false;
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let up = mouse.kind == MouseEventKind::ScrollUp;
+                if alt_screen {
+                    // Full-screen programs without mouse support (less, man) scroll with arrows.
+                    let key = KeyEvent::new(
+                        if up { KeyCode::Up } else { KeyCode::Down },
+                        KeyModifiers::NONE,
+                    );
+                    if let Some(bytes) = key_to_bytes(&key, app_cursor) {
+                        write_pty(app, &bytes.repeat(3));
+                    }
+                } else {
+                    scroll_terminal(app, if up { 3 } else { -3 });
+                }
             }
             _ => {}
         }
-    } else if layout
-        .term_area
-        .contains(Position::new(mouse.column, mouse.row))
-        || app.is_selecting
-    {
-        let (parser, writer) = (&app.parser, &mut app.pty_write);
-        let mut parser = parser.lock().unwrap();
-        let screen = parser.screen_mut();
+    }
+}
 
-        let tx = mouse.column.saturating_sub(layout.term_area.x);
-        let ty = mouse.row.saturating_sub(layout.term_area.y);
+fn handle_list_mouse(app: &mut App, mouse: MouseEvent, list_area: Rect) {
+    let filtered = app.filtered_indices();
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            let current = app.sidebar_state.selected().unwrap_or(0);
+            app.sidebar_state.select(Some(current.saturating_sub(1)));
+        }
+        MouseEventKind::ScrollDown => {
+            let current = app.sidebar_state.selected().unwrap_or(0);
+            if current + 1 < filtered.len() {
+                app.sidebar_state.select(Some(current + 1));
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let index = (mouse.row - list_area.y) as usize + app.sidebar_state.offset();
+            let Some(&original_index) = filtered.get(index) else {
+                return;
+            };
+            let entry = app.entries()[original_index].clone();
+            let now = Instant::now();
+            let is_double_click = app.last_clicked_index == Some(index)
+                && app
+                    .last_click_time
+                    .is_some_and(|t| now.duration_since(t) < Duration::from_millis(300));
 
-        if screen.mouse_protocol_mode() == MouseProtocolMode::None {
-            match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    app.is_selecting = true;
-                    app.selection_start = Some((ty, tx));
-                    app.selection_end = Some((ty, tx));
-                    return;
-                }
-                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved
-                    if app.is_selecting =>
+            if is_double_click {
+                app.last_click_time = None;
+                app.last_clicked_index = None;
+                if let Some(path) = entry.path.as_ref().filter(|_| entry.kind != EntryKind::History)
                 {
-                    app.selection_end = Some((ty, tx));
-                    return;
-                }
-                MouseEventKind::Up(MouseButton::Left) if app.is_selecting => {
-                    app.is_selecting = false;
-                    if app.selection_start == app.selection_end {
-                        app.selection_start = None;
-                        app.selection_end = None;
+                    if let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified()) {
+                        app.editing_file = Some((path.clone(), mtime));
                     }
-                    return;
+                    open_in_editor(app, path);
                 }
-                _ => {}
+                return;
+            }
+
+            app.sidebar_state.select(Some(index));
+            app.last_click_time = Some(now);
+            app.last_clicked_index = Some(index);
+
+            let x = mouse.column - list_area.x;
+            let is_delete_click = app.sidebar_mode == SidebarMode::Gists
+                && is_deletable(&entry)
+                && x >= list_area.width.saturating_sub(4)
+                && x < list_area.width.saturating_sub(1);
+
+            if is_delete_click {
+                app.show_delete_confirm = true;
+                app.gist_to_delete = entry.path.clone();
+            } else if x <= 1 {
+                let line = run_line(&entry);
+                write_pty(app, line.as_bytes());
             }
         }
+        _ => {}
+    }
+}
 
-        if screen.mouse_protocol_encoding() == MouseProtocolEncoding::Sgr {
-            let x = mouse.column.saturating_sub(layout.term_area.x) + 1;
-            let y = mouse.row.saturating_sub(layout.term_area.y) + 1;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
 
-            let (button, event_char) = match mouse.kind {
-                MouseEventKind::Down(btn) => (btn, 'M'),
-                MouseEventKind::Up(btn) => (btn, 'm'),
-                MouseEventKind::ScrollUp => (MouseButton::Left, 'M'),
-                MouseEventKind::ScrollDown => (MouseButton::Left, 'M'),
-                MouseEventKind::Drag(btn) => (btn, 'M'),
-                _ => return,
-            };
-
-            let button_code = match mouse.kind {
-                MouseEventKind::ScrollUp => 64,
-                MouseEventKind::ScrollDown => 65,
-                MouseEventKind::Drag(MouseButton::Left) => 32,
-                MouseEventKind::Drag(MouseButton::Middle) => 33,
-                MouseEventKind::Drag(MouseButton::Right) => 34,
-                _ => match button {
-                    MouseButton::Left => 0,
-                    MouseButton::Right => 1,
-                    MouseButton::Middle => 2,
-                },
-            };
-
-            let seq = format!("\x1b[<{};{};{}{}", button_code, x, y, event_char);
-            let _ = writer.write_all(seq.as_bytes());
-            let _ = writer.flush();
-        } else {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    let current = screen.scrollback();
-                    screen.set_scrollback(current + 3);
-                }
-                MouseEventKind::ScrollDown => {
-                    let current = screen.scrollback();
-                    screen.set_scrollback(current.saturating_sub(3));
-                }
-                _ => {}
-            }
+    fn entry(kind: EntryKind, path: Option<&str>, key: &str) -> Entry {
+        Entry {
+            label: "label2".into(),
+            key: key.into(),
+            command: "echo hi".into(),
+            info: String::new(),
+            kind,
+            path: path.map(PathBuf::from),
+            mtime: None,
+            remote_name: None,
         }
+    }
+
+    #[test]
+    fn run_line_references_file_and_key_with_quoting() {
+        let line = run_line(&entry(EntryKind::Command, Some("/home/a b/commands.txt"), "it's"));
+        assert!(line.ends_with(" run '/home/a b/commands.txt' 'it'\\''s'\r"), "{}", line);
+        assert!(line.starts_with(&exe_word()));
+    }
+
+    #[test]
+    fn run_line_types_history_directly() {
+        assert_eq!(run_line(&entry(EntryKind::History, None, "")), "echo hi\r");
+    }
+
+    #[test]
+    fn send_command_line_only_wraps_prompt_commands() {
+        assert_eq!(send_command_line("git status\r"), "git status\r");
+        let wrapped = send_command_line("ssh <prompt:Host>\r");
+        assert!(wrapped.ends_with(" exec 'ssh <prompt:Host>'\r"), "{}", wrapped);
     }
 }

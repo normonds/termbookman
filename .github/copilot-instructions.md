@@ -7,7 +7,7 @@
 ### Stack
 - **TUI**: ratatui + crossterm (cross-platform terminal events)
 - **Shell**: portable-pty (PTY abstraction) + vt100 parser (ANSI escape sequences)
-- **Async**: tokio, futures, mpsc channels
+- **Concurrency**: std threads + `std::sync::mpsc` channel (no async runtime)
 - **APIs**: reqwest (GitHub REST API), serde/toml (config)
 
 ---
@@ -101,7 +101,7 @@ pub enum Message {
 - PTY reader thread: Sends `PtyData` message when shell output available
 - Event thread: Sends `Event(KeyEvent/MouseEvent)` messages
 - Ticker thread: Sends `Tick` messages every 1 second
-- GitHub thread: Spawned via tokio for non-blocking gist operations
+- GitHub thread: Spawned with `std::thread::spawn` for non-blocking gist operations
 
 ---
 
@@ -141,7 +141,7 @@ master.resize(PtySize { rows, cols, ... })?;
 Actions (mouse clicks, key bindings) defined in config.toml; handlers.rs queries config to dispatch behavior. Allows remappable controls.
 
 ### 6. **Non-Blocking GitHub Operations**
-Gist fetch/upload spawned in tokio thread, result sent back via Message channel. Main thread never blocks on network I/O.
+Gist fetch/upload spawned in a std thread, result sent back via Message channel. Main thread never blocks on network I/O.
 
 ---
 
@@ -163,7 +163,7 @@ Gist fetch/upload spawned in tokio thread, result sent back via Message channel.
 ### Extending GitHub Integration
 1. Add new Message variant in app.rs
 2. Implement API call in github.rs (use reqwest client)
-3. Spawn tokio thread in main.rs or github.rs
+3. Spawn a std thread in main.rs that calls github.rs
 4. Send result back via `tx.send(Message::...)`
 5. Handle result in app state update
 
@@ -202,7 +202,7 @@ cargo build --target aarch64-unknown-linux-gnu  # Cross-compile test
 - **Naming**: `snake_case` for functions/variables, `PascalCase` for types/enums
 - **Error handling**: Use `?` operator; main returns `Result<(), Box<dyn Error>>`
 - **Comments**: Document why (intent), not what (code is clear). Link related issues/PRs.
-- **Async**: Prefer tokio for I/O (`tokio::spawn`), avoid blocking waits
+- **Background work**: Run network/disk I/O in `std::thread::spawn` and report back via `Message`; never block the UI thread
 - **Testing**: Unit tests inline (`#[cfg(test)]`), integration tests in `tests/` folder
 
 ---

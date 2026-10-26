@@ -4,17 +4,51 @@ use std::error::Error;
 
 use std::path::PathBuf;
 
+/// Directory holding config.toml, commands.txt, the gist cache and debug.log.
+///
+/// `TERMBOOKMAN_CONFIG_DIR` overrides it. Under sudo the invoking user's directory is used so
+/// that sudo and non-sudo runs share the same files.
 pub fn get_config_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("TERMBOOKMAN_CONFIG_DIR").filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
     if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-        let home = if sudo_user == "root" {
-            PathBuf::from("/root")
-        } else {
-            PathBuf::from("/home").join(sudo_user)
-        };
-        return Some(home.join(".config").join("termbookman"));
+        if let Some(home) = home_dir_of(&sudo_user) {
+            return Some(home.join(".config").join("termbookman"));
+        }
     }
 
     directories::ProjectDirs::from("", "", "termbookman").map(|p| p.config_dir().to_path_buf())
+}
+
+/// Cached gist files live here.
+pub fn gist_dir() -> PathBuf {
+    get_config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("gists")
+}
+
+pub fn commands_txt_path() -> Option<PathBuf> {
+    get_config_dir().map(|d| d.join("commands.txt"))
+}
+
+#[cfg(unix)]
+fn home_dir_of(user: &str) -> Option<PathBuf> {
+    let name = std::ffi::CString::new(user).ok()?;
+    // SAFETY: getpwnam returns a pointer to static storage or null; we copy out immediately.
+    unsafe {
+        let pw = libc::getpwnam(name.as_ptr());
+        if pw.is_null() || (*pw).pw_dir.is_null() {
+            return None;
+        }
+        let dir = std::ffi::CStr::from_ptr((*pw).pw_dir);
+        Some(PathBuf::from(dir.to_string_lossy().into_owned()))
+    }
+}
+
+#[cfg(not(unix))]
+fn home_dir_of(_user: &str) -> Option<PathBuf> {
+    None
 }
 
 #[derive(Deserialize, Serialize, Clone, Default)]
@@ -65,7 +99,7 @@ pub struct AuthConfig {
     pub update_url: String,
     #[serde(default)]
     pub scope: String,
-    /// Set to false in config.toml to disable auto-syncing commands.txt to a Gist on change.
+    /// Set to true in config.toml to upload commands.txt to a private Gist whenever it changes.
     #[serde(default = "default_sync_commands")]
     pub sync_commands_to_gist: bool,
 }
@@ -77,7 +111,7 @@ fn default_update_url() -> String {
     "https://github.com/normonds/termbookman/releases/latest/download/tbm".to_string()
 }
 fn default_sync_commands() -> bool {
-    true
+    false
 }
 
 #[derive(Deserialize, Serialize, Clone, Default)]
@@ -135,18 +169,15 @@ pub enum ConditionType {
 
 pub fn save_config(config: &Config) -> Result<(), Box<dyn Error>> {
     if let Some(config_dir) = get_config_dir() {
-        if !config_dir.exists() {
-            std::fs::create_dir_all(&config_dir)?;
-        }
         let config_file = config_dir.join("config.toml");
         let content = toml::to_string_pretty(config)?;
-        std::fs::write(config_file, content)?;
+        // config.toml holds the GitHub token, so keep it private.
+        crate::utils::write_private_file(&config_file, content)?;
     }
     Ok(())
 }
 
-pub fn load_config() -> Config {
-    let default_config = r##"
+pub const DEFAULT_CONFIG: &str = r##"
 external_editor = "nano"
 
 [ui]
@@ -159,6 +190,8 @@ lower_statusbar_bg = "#000000"
 scope = "gist"
 personal_access_token = "YOUR_TOKEN_HERE"
 update_url = "https://github.com/normonds/termbookman/releases/latest/download/tbm"
+# Upload commands.txt to a private Gist whenever it changes.
+sync_commands_to_gist = false
 
 [statusbar]
 [[statusbar.upper]]
@@ -253,6 +286,7 @@ color = "red"
 hover_color = "light_red"
 "##;
 
+pub fn load_config() -> Config {
     if let Some(config_dir) = get_config_dir() {
         let config_file = config_dir.join("config.toml");
         log_debug(&format!("Checking config at: {:?}", config_file));
@@ -270,16 +304,43 @@ hover_color = "light_red"
                 }
             }
         } else {
-            if !config_dir.exists() {
-                let _ = std::fs::create_dir_all(&config_dir);
-            }
             log_debug("Config file not found, writing default");
-            let _ = std::fs::write(&config_file, default_config);
+            let _ = crate::utils::write_private_file(&config_file, DEFAULT_CONFIG);
         }
     } else {
         log_debug("Could not determine project directories");
     }
 
     log_debug("Falling back to default config");
-    toml::from_str(default_config).unwrap_or_default()
+    toml::from_str(DEFAULT_CONFIG).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_parses_and_is_safe_by_default() {
+        let config: Config = toml::from_str(DEFAULT_CONFIG).expect("default config must parse");
+        assert!(!config.auth.sync_commands_to_gist);
+        assert_eq!(config.external_editor, "nano");
+        assert!(config.statusbar.lower.iter().any(|i| i.action == Some(ActionType::Quit)));
+    }
+
+    #[test]
+    fn missing_sync_key_defaults_to_off() {
+        let config: Config = toml::from_str("[auth]\nscope = \"gist\"\n").unwrap();
+        assert!(!config.auth.sync_commands_to_gist);
+        assert_eq!(config.external_editor, "nano");
+    }
+
+    #[test]
+    fn config_round_trips_through_toml() {
+        let mut config: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        config.auth.personal_access_token = Some("abc".into());
+        let text = toml::to_string_pretty(&config).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.auth.personal_access_token.as_deref(), Some("abc"));
+        assert_eq!(back.statusbar.upper.len(), config.statusbar.upper.len());
+    }
 }

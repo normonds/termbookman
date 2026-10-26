@@ -18,7 +18,7 @@ pub fn render_modals(f: &mut Frame, app: &mut App, area: Rect) {
         let menu_items = vec![
             ListItem::new("b: Run Btop").style(Style::default().bg(Color::Black)),
             ListItem::new("s: Check Space").style(Style::default().bg(Color::Black)),
-            ListItem::new("q: Close").style(Style::default().bg(Color::Black)),
+            ListItem::new("q/Esc: Close").style(Style::default().bg(Color::Black)),
         ];
         f.render_widget(
             List::new(menu_items)
@@ -275,97 +275,6 @@ pub fn render_modals(f: &mut Frame, app: &mut App, area: Rect) {
         );
     }
 
-    if app.show_upload_confirm {
-        let modal_area = centered_rect_fixed(50, 10, area);
-        f.render_widget(Clear, modal_area);
-        let block = Block::default()
-            .title(Span::styled(
-                " Upload Modified Gist? ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
-            .style(Style::default().bg(Color::Black));
-        f.render_widget(block.clone(), modal_area);
-        let inner = block.inner(modal_area);
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // Filename
-                Constraint::Length(2), // Question
-                Constraint::Length(1), // Spacer
-                Constraint::Length(1), // Buttons
-                Constraint::Min(0),
-            ])
-            .split(inner);
-
-        let filename = app
-            .pending_gist_file
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|f| f.to_string_lossy())
-            .unwrap_or_default();
-        f.render_widget(
-            Paragraph::new(format!("File '{}' was modified locally.", filename))
-                .alignment(ratatui::layout::Alignment::Center),
-            chunks[0],
-        );
-        f.render_widget(
-            Paragraph::new("\nUpload changes to GitHub Gist?")
-                .alignment(ratatui::layout::Alignment::Center),
-            chunks[1],
-        );
-
-        let button_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(chunks[3]);
-
-        let is_yes_hovered = if let Some((mx, my)) = app.mouse_pos {
-            button_chunks[0].contains(ratatui::layout::Position::new(mx, my))
-        } else {
-            false
-        };
-        let is_no_hovered = if let Some((mx, my)) = app.mouse_pos {
-            button_chunks[1].contains(ratatui::layout::Position::new(mx, my))
-        } else {
-            false
-        };
-
-        let yes_style = if is_yes_hovered {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Green)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Green).bg(Color::Rgb(20, 40, 20))
-        };
-        let no_style = if is_no_hovered {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Red)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Red).bg(Color::Rgb(40, 20, 20))
-        };
-
-        f.render_widget(
-            Paragraph::new(" [Y] Yes, Upload ")
-                .style(yes_style)
-                .alignment(ratatui::layout::Alignment::Center),
-            button_chunks[0],
-        );
-        f.render_widget(
-            Paragraph::new(" [N] No, Keep Local ")
-                .style(no_style)
-                .alignment(ratatui::layout::Alignment::Center),
-            button_chunks[1],
-        );
-    }
-
     if app.show_new_gist_dialog {
         let modal_area = centered_rect_fixed(50, 10, area);
         f.render_widget(Clear, modal_area);
@@ -444,11 +353,15 @@ pub fn render_modals(f: &mut Frame, app: &mut App, area: Rect) {
             ])
             .split(inner);
 
-        let gist_name = app
-            .gist_index_to_delete
-            .and_then(|idx| app.gist_items.get(idx))
-            .cloned()
+        let target = app.gist_to_delete.as_ref().and_then(|p| {
+            app.gist_entries.iter().find(|e| e.path.as_ref() == Some(p))
+        });
+        let gist_name = target
+            .map(|e| e.label.clone())
             .unwrap_or_else(|| "Unknown Script".to_string());
+        let file_name = target
+            .and_then(|e| e.remote_name.clone())
+            .unwrap_or_default();
 
         f.render_widget(
             Paragraph::new("Are you sure you want to delete this script?")
@@ -457,8 +370,8 @@ pub fn render_modals(f: &mut Frame, app: &mut App, area: Rect) {
         );
         f.render_widget(
             Paragraph::new(format!(
-                "'{}'\nIt will be removed locally and from GitHub.",
-                gist_name
+                "'{}' ({})\nThe file is removed locally and from its Gist.",
+                gist_name, file_name
             ))
             .alignment(ratatui::layout::Alignment::Center),
             chunks[1],

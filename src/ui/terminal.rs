@@ -72,6 +72,9 @@ pub fn render_terminal(f: &mut Frame, app: &mut App, area: Rect, scrollbar_area:
                     if cell.bold() {
                         style = style.add_modifier(Modifier::BOLD);
                     }
+                    if cell.dim() {
+                        style = style.add_modifier(Modifier::DIM);
+                    }
                     if cell.italic() {
                         style = style.add_modifier(Modifier::ITALIC);
                     }
@@ -119,10 +122,14 @@ pub fn render_terminal(f: &mut Frame, app: &mut App, area: Rect, scrollbar_area:
             }
         }
 
-        let (cursor_row, cursor_col) = screen.cursor_position();
-        let cx = (area.x + cursor_col).min(area.right().saturating_sub(1));
-        let cy = (area.y + cursor_row).min(area.bottom().saturating_sub(1));
-        f.set_cursor(cx, cy);
+        // Only show the cursor when the program wants it and we're not viewing scrollback;
+        // ratatui hides the cursor when it is not set.
+        if !screen.hide_cursor() && screen.scrollback() == 0 && area.width > 0 && area.height > 0 {
+            let (cursor_row, cursor_col) = screen.cursor_position();
+            let cx = (area.x + cursor_col).min(area.right().saturating_sub(1));
+            let cy = (area.y + cursor_row).min(area.bottom().saturating_sub(1));
+            f.set_cursor(cx, cy);
+        }
 
         // Render scrollbar
         let scrollbar_bg = if std::env::var("SUDO_USER").is_ok() {

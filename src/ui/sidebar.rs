@@ -1,5 +1,7 @@
 use crate::app::{App, SidebarMode};
-use crate::utils::parse_color;
+use crate::app::is_deletable;
+use crate::entry::Entry;
+use crate::utils::{display_width, parse_color, truncate_to_width};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -153,53 +155,34 @@ pub fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect, scrollbar_area: 
         " "
     };
 
-    let (items, infos, commands) = match app.sidebar_mode {
-        SidebarMode::Commands => (
-            &app.sidebar_items,
-            Some(&app.sidebar_infos),
-            &app.sidebar_commands,
-        ),
-        SidebarMode::History => (&app.history_items, None, &app.history_commands),
-        SidebarMode::Gists => (&app.gist_items, Some(&app.gist_infos), &app.gist_commands),
-    };
+    let entries = app.entries();
 
     let search_text = if app.search_query.is_empty() && !app.is_search_focused {
-        format!(" Search {} items .. ", items.len())
+        format!(" Search {} items .. ", entries.len())
     } else {
         format!(" {}{} ", app.search_query, cursor_char)
     };
     f.render_widget(Paragraph::new(search_text).style(search_style), search_area);
 
-    let filtered_items: Vec<(usize, &String)> = items
-        .iter()
-        .enumerate()
-        .filter(|(idx, label)| {
-            let matches_label = label
-                .to_lowercase()
-                .contains(&app.search_query.to_lowercase());
-            let matches_info = if let Some(infos) = infos {
-                infos[*idx]
-                    .to_lowercase()
-                    .contains(&app.search_query.to_lowercase())
-            } else {
-                false
-            };
-            matches_label || matches_info
-        })
+    let filtered_items: Vec<(usize, &Entry)> = app
+        .filtered_indices()
+        .into_iter()
+        .map(|i| (i, &entries[i]))
         .collect();
 
+    let filtered_len = filtered_items.len();
     let sidebar_list_items: Vec<ListItem> = filtered_items
         .iter()
         .enumerate()
-        .map(|(idx, (i, item))| {
+        .map(|(idx, (_, entry))| {
             let color = match app.sidebar_mode {
                 SidebarMode::History => Color::Rgb(200, 200, 200),
                 SidebarMode::Gists => Color::Yellow,
                 SidebarMode::Commands => {
-                    if commands[*i].contains("<prompt") {
+                    if entry.command.contains("<prompt") {
                         Color::Green
-                    } else if commands[*i].contains("sudo")
-                        || (infos.is_some() && infos.unwrap()[*i].to_lowercase().contains("sudo"))
+                    } else if entry.command.contains("sudo")
+                        || entry.info.to_lowercase().contains("sudo")
                     {
                         Color::Red
                     } else {
@@ -278,15 +261,13 @@ pub fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect, scrollbar_area: 
 
             let symbol = "▸";
 
-            let (info, is_fallback) = if let Some(infos) = infos {
-                let info_text = &infos[*i];
-                if info_text.trim().is_empty() || info_text.len() < 3 {
-                    (format!(" {}", commands[*i]), true)
-                } else {
-                    (format!(" {}", info_text), false)
-                }
-            } else {
+            let has_info = app.sidebar_mode != SidebarMode::History;
+            let (info, is_fallback) = if !has_info {
                 (String::new(), false)
+            } else if entry.info.trim().chars().count() < 3 {
+                (format!(" {}", entry.command), true)
+            } else {
+                (format!(" {}", entry.info), false)
             };
 
             let label_text =
@@ -295,39 +276,16 @@ pub fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect, scrollbar_area: 
                     let spinner = ["|", "/", "-", "\\"][(now / 150 % 4) as usize];
                     format!("{} LOADING ...", spinner)
                 } else {
-                    item.to_string()
+                    entry.label.clone()
                 };
 
-            // Detect script items via __SCRIPT__ tag in info field
-            let is_script = if let Some(infos) = infos {
-                infos[*i].starts_with("__SCRIPT__")
-            } else {
-                false
-            };
-
-            // Strip __SCRIPT__ prefix from label if present (gists tab)
-            let label_text = if label_text.starts_with("__SCRIPT__") {
-                label_text[10..].to_string()
-            } else {
-                label_text
-            };
-
-            // Strip __SCRIPT__ from info display text
-            let info = if info.trim_start().starts_with("__SCRIPT__") {
-                let s = info.replacen("__SCRIPT__", "", 1);
-                if s.starts_with("  ") {
-                    s[1..].to_string()
-                } else {
-                    s
-                }
-            } else {
-                info
-            };
+            let is_script = entry.is_script();
+            let is_deletable = app.sidebar_mode == SidebarMode::Gists && is_deletable(entry);
 
             let mut command_text = String::new();
             let mut hide_info = false;
-            if label_text.len() < 20 && app.sidebar_mode != SidebarMode::History {
-                command_text = format!(" {}", commands[*i]);
+            if display_width(&label_text) < 20 && app.sidebar_mode != SidebarMode::History {
+                command_text = format!(" {}", entry.command);
                 if is_fallback {
                     hide_info = true;
                 }
@@ -358,12 +316,8 @@ pub fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect, scrollbar_area: 
             }
 
             // Add label
-            let label_to_draw = if label_text.len() > avail {
-                format!("{}..", &label_text[..avail.saturating_sub(2)])
-            } else {
-                label_text.clone()
-            };
-            avail = avail.saturating_sub(label_to_draw.len());
+            let label_to_draw = truncate_to_width(&label_text, avail);
+            avail = avail.saturating_sub(display_width(&label_to_draw));
             spans.push(Span::styled(label_to_draw, style));
 
             // Add SCRIPT badge
@@ -374,27 +328,19 @@ pub fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect, scrollbar_area: 
 
             // Add info
             if !hide_info && !info.is_empty() && avail > 3 {
-                let info_to_draw = if info.len() > avail {
-                    format!("{}..", &info[..avail.saturating_sub(2)])
-                } else {
-                    info.clone()
-                };
-                avail = avail.saturating_sub(info_to_draw.len());
+                let info_to_draw = truncate_to_width(&info, avail);
+                avail = avail.saturating_sub(display_width(&info_to_draw));
                 spans.push(Span::styled(info_to_draw, info_style));
             }
 
             // Add command preview
             if !command_text.is_empty() && avail > 3 {
-                let cmd_to_draw = if command_text.len() > avail {
-                    format!("{}..", &command_text[..avail.saturating_sub(2)])
-                } else {
-                    command_text.clone()
-                };
-                avail = avail.saturating_sub(cmd_to_draw.len());
+                let cmd_to_draw = truncate_to_width(&command_text, avail);
+                avail = avail.saturating_sub(display_width(&cmd_to_draw));
                 spans.push(Span::styled(cmd_to_draw, command_style));
             }
 
-            if app.sidebar_mode == SidebarMode::Gists && is_script {
+            if is_deletable {
                 if avail > 0 {
                     spans.push(Span::styled(
                         " ".repeat(avail),
@@ -421,7 +367,7 @@ pub fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect, scrollbar_area: 
 
     let sidebar_scroll_pos = app.sidebar_state.selected().unwrap_or(0);
     let mut sidebar_scrollbar_state =
-        ScrollbarState::new(filtered_items.len()).position(sidebar_scroll_pos);
+        ScrollbarState::new(filtered_len).position(sidebar_scroll_pos);
 
     let is_sidebar_scrollbar_hovered = if let Some((mx, my)) = app.mouse_pos {
         scrollbar_area.contains(Position::new(mx, my))

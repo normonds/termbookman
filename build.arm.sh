@@ -11,7 +11,7 @@ cargo build --release --target aarch64-unknown-linux-gnu
 if [ -f target/aarch64-unknown-linux-gnu/release/rust-dashboard ]; then
     cp target/aarch64-unknown-linux-gnu/release/rust-dashboard ./tbm.arm
     echo "------------------------------------------------"
-    echo "Build complete! ARM binary: ./termbookman.arm"
+    echo "Build complete! ARM binary: ./tbm.arm"
     echo "------------------------------------------------"
 else
     echo "Build failed. Check error messages above."

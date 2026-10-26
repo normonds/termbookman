@@ -52,12 +52,20 @@ jobs:
         run: |
           mkdir -p bin
           cp target/${{ matrix.target }}/release/rust-dashboard bin/${{ matrix.release_name }}
+          # The in-app updater refuses binaries without a matching checksum.
+          (cd bin && sha256sum ${{ matrix.release_name }} > ${{ matrix.release_name }}.sha256)
+
+      - name: Test
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo test --release
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.release_name }}
-          path: bin/${{ matrix.release_name }}
+          path: |
+            bin/${{ matrix.release_name }}
+            bin/${{ matrix.release_name }}.sha256
 
   release:
     name: Create Release
@@ -84,7 +92,9 @@ jobs:
           name: v${{ steps.date.outputs.date }}
           files: |
             bin/tbm
+            bin/tbm.sha256
             bin/tbm.arm
+            bin/tbm.arm.sha256
           draft: false
           prerelease: false
           make_latest: true
