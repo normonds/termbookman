@@ -713,6 +713,31 @@ mod tests {
     }
 
     #[test]
+    fn vt100_patch_keeps_scrollback_under_apt_progress_bar() {
+        // apt reserves the last row with a top-anchored scroll region and redraws its bar
+        // there; output scrolling inside the region must still reach scrollback.
+        let mut parser = Parser::new(3, 20, 10);
+        parser.process(b"\x1b[1;2r");
+        for i in 0..4 {
+            parser.process(format!("line{i}\r\n").as_bytes());
+            parser.process(b"\x1b7\x1b[3;1Hbar\x1b8");
+        }
+        let screen = parser.screen_mut();
+        screen.set_scrollback(usize::MAX);
+        assert_eq!(screen.scrollback(), 3);
+        assert_eq!(screen.contents(), "line0\nline1\nline2");
+        screen.set_scrollback(0);
+        assert_eq!(screen.contents(), "line3\n\nbar");
+
+        // A region below the top of the screen must not feed scrollback.
+        let mut parser = Parser::new(3, 20, 10);
+        parser.process(b"top\x1b[2;3r\x1b[2;1H");
+        parser.process(b"a\r\nb\r\nc\r\n");
+        parser.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(parser.screen().scrollback(), 0);
+    }
+
+    #[test]
     fn edit_text_ignores_control_chords() {
         let mut s = String::from("ab");
         assert!(!edit_text(&mut s, &KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));

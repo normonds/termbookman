@@ -566,7 +566,9 @@ impl Grid {
             self.rows
                 .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
             let removed = self.rows.remove(usize::from(self.scroll_top));
-            if self.scrollback_len > 0 && !self.scroll_region_active() {
+            // Like xterm and VTE, keep lines leaving a region that starts at the top of
+            // the screen (apt/dpkg reserve the last row for a progress bar this way).
+            if self.scrollback_len > 0 && self.scroll_top == 0 {
                 self.scrollback.push_back(removed);
                 while self.scrollback.len() > self.scrollback_len {
                     self.scrollback.pop_front();
@@ -604,10 +606,6 @@ impl Grid {
 
     fn in_scroll_region(&self) -> bool {
         self.pos.row >= self.scroll_top && self.pos.row <= self.scroll_bottom
-    }
-
-    fn scroll_region_active(&self) -> bool {
-        self.scroll_top != 0 || self.scroll_bottom != self.size.rows - 1
     }
 
     pub fn set_origin_mode(&mut self, mode: bool) {
