@@ -559,6 +559,15 @@ mod tests {
     }
 
     #[test]
+    fn hvp_positions_cursor_like_cup() {
+        let mut parser = vt100::Parser::new(3, 10, 0);
+        parser.process(b"\x1b[2;4fX\x1b[3;1HY\x1b[fZ");
+        assert_eq!(parser.screen().cell(1, 3).unwrap().contents(), "X");
+        assert_eq!(parser.screen().cell(2, 0).unwrap().contents(), "Y");
+        assert_eq!(parser.screen().cell(0, 0).unwrap().contents(), "Z");
+    }
+
+    #[test]
     fn git_info_reports_branch_for_a_repo() {
         let dir = crate::utils::test_dir("git");
         let ok = Command::new("git")

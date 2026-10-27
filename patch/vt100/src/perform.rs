@@ -143,7 +143,8 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                 'E' => self.screen.cnl(canonicalize_params_1(params, 1)),
                 'F' => self.screen.cpl(canonicalize_params_1(params, 1)),
                 'G' => self.screen.cha(canonicalize_params_1(params, 1)),
-                'H' => self.screen.cup(canonicalize_params_2(params, 1, 1)),
+                // HVP (`f`) is CUP under another name; btop positions everything with it.
+                'H' | 'f' => self.screen.cup(canonicalize_params_2(params, 1, 1)),
                 'J' => self
                     .screen
                     .ed(canonicalize_params_1(params, 0), unhandled),
