@@ -40,7 +40,7 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user-static qemu-user
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu qemu-user-static
 
       - name: Lint and Format Check
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -65,8 +65,7 @@ jobs:
       - name: Test
         run: |
           if [ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]; then
-            RUNNER=$(which qemu-aarch64-static || which qemu-aarch64)
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="$RUNNER -L /usr/aarch64-linux-gnu"
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64-static -L /usr/aarch64-linux-gnu"
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
           fi
           cargo test --release --target ${{ matrix.target }}
