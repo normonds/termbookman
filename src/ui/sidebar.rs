@@ -1,5 +1,5 @@
-use crate::app::{App, SidebarMode};
 use crate::app::is_deletable;
+use crate::app::{App, SidebarMode};
 use crate::entry::Entry;
 use crate::utils::{display_width, parse_color, truncate_to_width};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
@@ -11,16 +11,25 @@ use ratatui::widgets::{
 use ratatui::Frame;
 use std::time::Instant;
 
-pub fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect, scrollbar_area: Rect) {
-    let sidebar_bg = parse_color(&app.config.ui.sidebar_bg);
-    let parser = app.parser.lock().unwrap();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SidebarRects {
+    pub area: Rect,
+    pub tabs: Rect,
+    pub search: Rect,
+    pub list: Rect,
+    pub new_button: Option<Rect>,
+}
+
+pub fn is_sidebar_locked(app: &App) -> bool {
+    let parser = app.lock_parser();
     let screen = parser.screen();
     let is_app_active =
         screen.alternate_screen() || screen.hide_cursor() || screen.application_cursor();
-    let is_sidebar_locked = is_app_active || app.is_pty_busy;
-    drop(parser); // Release lock before further rendering if needed, though usually Frame uses it. Actually keep it if we need more info.
+    is_app_active || app.is_pty_busy
+}
 
-    let sidebar_layout = if app.sidebar_mode == SidebarMode::Gists && !is_sidebar_locked {
+pub fn sidebar_layout(area: Rect, is_gists: bool, is_locked: bool) -> SidebarRects {
+    let chunks = if is_gists && !is_locked {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -41,17 +50,37 @@ pub fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect, scrollbar_area: 
             .split(area)
     };
 
-    let tabs_area = sidebar_layout[0];
-    let (new_button_area, search_area, list_area) =
-        if app.sidebar_mode == SidebarMode::Gists && !is_sidebar_locked {
-            (
-                Some(sidebar_layout[3]),
-                sidebar_layout[1],
-                sidebar_layout[2],
-            )
+    SidebarRects {
+        area,
+        tabs: chunks[0],
+        search: chunks[1],
+        list: chunks[2],
+        new_button: if is_gists && !is_locked {
+            Some(chunks[3])
         } else {
-            (None, sidebar_layout[1], sidebar_layout[2])
-        };
+            None
+        },
+    }
+}
+
+pub fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect, scrollbar_area: Rect) {
+    let sidebar_bg = parse_color(&app.config.ui.sidebar_bg);
+    let is_sidebar_locked = is_sidebar_locked(app);
+    let is_app_active = {
+        let parser = app.lock_parser();
+        let screen = parser.screen();
+        screen.alternate_screen() || screen.hide_cursor() || screen.application_cursor()
+    };
+
+    let rects = sidebar_layout(
+        area,
+        app.sidebar_mode == SidebarMode::Gists,
+        is_sidebar_locked,
+    );
+    let tabs_area = rects.tabs;
+    let new_button_area = rects.new_button;
+    let search_area = rects.search;
+    let list_area = rects.list;
 
     if let Some(area) = new_button_area {
         let is_hovered = if let Some((mx, my)) = app.mouse_pos {
@@ -149,7 +178,7 @@ pub fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect, scrollbar_area: 
     };
 
     let now = Instant::now().duration_since(app.start_time).as_millis();
-    let cursor_char = if app.is_search_focused && (now / 500) % 2 == 0 {
+    let cursor_char = if app.is_search_focused && (now / 500).is_multiple_of(2) {
         "_"
     } else {
         " "
@@ -166,8 +195,8 @@ pub fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect, scrollbar_area: 
 
     let filtered_items: Vec<(usize, &Entry)> = app
         .filtered_indices()
-        .into_iter()
-        .map(|i| (i, &entries[i]))
+        .iter()
+        .map(|&i| (i, &entries[i]))
         .collect();
 
     let filtered_len = filtered_items.len();

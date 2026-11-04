@@ -1,5 +1,5 @@
 use crate::app::{is_deletable, App, Message, SidebarMode};
-use crate::config::ActionType;
+use crate::config::{ActionType, ItemType};
 use crate::entry::{Entry, EntryKind};
 use crate::input::{encode_mouse, key_to_bytes};
 use crate::ui::{calculate_layout, modals, statusbar};
@@ -7,6 +7,7 @@ use crate::utils::{log_debug, shell_quote};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use vt100::MouseProtocolMode;
@@ -16,34 +17,54 @@ fn write_pty(app: &mut App, bytes: &[u8]) {
     let _ = app.pty_write.flush();
 }
 
+pub fn sanitize_exe_path(exe: &Path) -> PathBuf {
+    let s = exe.to_string_lossy();
+    if let Some(stripped) = s.strip_suffix(" (deleted)") {
+        PathBuf::from(stripped)
+    } else {
+        exe.to_path_buf()
+    }
+}
+
+#[allow(dead_code)]
 fn exe_word() -> String {
     let exe = std::env::current_exe().unwrap_or_default();
-    shell_quote(&exe.to_string_lossy())
+    shell_quote(&sanitize_exe_path(&exe).to_string_lossy())
 }
 
 /// The shell line that runs a sidebar entry. Entries from files are referenced by file and key,
 /// so the command run is exactly the one shown, whatever labels other sources produce.
 pub fn run_line(entry: &Entry) -> String {
+    run_line_with_exe(entry, &std::env::current_exe().unwrap_or_default())
+}
+
+pub fn run_line_with_exe(entry: &Entry, exe: &Path) -> String {
+    let exe_str = shell_quote(&sanitize_exe_path(exe).to_string_lossy());
     match (&entry.kind, &entry.path) {
         (EntryKind::History, _) => format!("{}\r", entry.command),
         (_, Some(path)) => format!(
             "{} run {} {}\r",
-            exe_word(),
+            exe_str,
             shell_quote(&path.to_string_lossy()),
             shell_quote(&entry.key)
         ),
-        (_, None) => format!("{} {}\r", exe_word(), shell_quote(&entry.label)),
+        (_, None) => format!("{} {}\r", exe_str, shell_quote(&entry.label)),
     }
 }
 
 /// The shell line for a status bar `send_command`. Commands with `<prompt:...>` tags go through
 /// `termbookman exec` so the prompts are asked interactively inside the terminal.
 pub fn send_command_line(cmd: &str) -> String {
+    send_command_line_with_exe(cmd, &std::env::current_exe().unwrap_or_default())
+}
+
+pub fn send_command_line_with_exe(cmd: &str, exe: &Path) -> String {
     if !cmd.contains("<prompt:") {
         return cmd.to_string();
     }
     let body = cmd.trim_end_matches(['\r', '\n']);
-    format!("{} exec {}\r", exe_word(), shell_quote(body))
+    let exe_str = shell_quote(&sanitize_exe_path(exe).to_string_lossy());
+    format!("{} exec {}\r", exe_str, shell_quote(body))
 }
 
 pub fn open_in_editor(app: &mut App, path: &std::path::Path) {
@@ -69,24 +90,27 @@ pub fn start_device_flow(app: &mut App, tx: &mpsc::Sender<Message>) {
     app.login_error = Some("Fetching GitHub code...".to_string());
     let scope = app.config.auth.scope.clone();
     let tx = tx.clone();
-    std::thread::spawn(move || match crate::github::request_device_code(&client_id, &scope) {
-        Ok(code) => {
-            let _ = tx.send(Message::DeviceCodeSuccess(code));
-        }
-        Err(e) => {
-            log_debug(&format!("GitHub auth error: {}", e));
-            let _ = tx.send(Message::AuthError(e));
-            let _ = tx.send(Message::DeviceFlowFinished);
-        }
-    });
+    std::thread::spawn(
+        move || match crate::github::request_device_code(&client_id, &scope) {
+            Ok(code) => {
+                let _ = tx.send(Message::DeviceCodeSuccess(code));
+            }
+            Err(e) => {
+                log_debug(&format!("GitHub auth error: {}", e));
+                let _ = tx.send(Message::AuthError(e));
+                let _ = tx.send(Message::DeviceFlowFinished);
+            }
+        },
+    );
 }
 
 /// Keys pressed while the menu modal is open.
 pub fn handle_menu_key(app: &mut App, key: &KeyEvent) {
-    match key.code {
-        KeyCode::Char('b') => write_pty(app, b"btop\r"),
-        KeyCode::Char('s') => write_pty(app, b"df -h\r"),
-        _ => {}
+    if let KeyCode::Char(c) = key.code {
+        if let Some(item) = app.config.menu.iter().find(|m| m.key == c) {
+            let cmd = format!("{}\r", item.command);
+            write_pty(app, cmd.as_bytes());
+        }
     }
     app.show_menu = false;
 }
@@ -94,7 +118,7 @@ pub fn handle_menu_key(app: &mut App, key: &KeyEvent) {
 /// Forwards a key press to the PTY.
 pub fn forward_key(app: &mut App, key: &KeyEvent) {
     let app_cursor = {
-        let mut p = app.parser.lock().unwrap();
+        let mut p = app.lock_parser();
         p.screen_mut().set_scrollback(0);
         p.screen().application_cursor()
     };
@@ -122,7 +146,7 @@ fn scrollback_from_track(app: &mut App, row: u16, track: Rect) {
         return;
     }
     let row = row.clamp(inner_y, inner_y + inner_h - 1);
-    let mut p = app.parser.lock().unwrap();
+    let mut p = app.lock_parser();
     let history_len = p.screen().scrollback_len() as f32;
     let pos = (row - inner_y) as f32 / inner_h.saturating_sub(1).max(1) as f32;
     p.screen_mut()
@@ -130,7 +154,7 @@ fn scrollback_from_track(app: &mut App, row: u16, track: Rect) {
 }
 
 fn scroll_terminal(app: &mut App, lines: isize) {
-    let mut p = app.parser.lock().unwrap();
+    let mut p = app.lock_parser();
     let current = p.screen().scrollback() as isize;
     p.screen_mut()
         .set_scrollback((current + lines).max(0) as usize);
@@ -142,93 +166,64 @@ pub fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sen
     let left_down = mouse.kind == MouseEventKind::Down(MouseButton::Left);
 
     if app.show_delete_confirm {
-        let area = modals::centered_rect_fixed(50, 10, size);
-        if area.contains(pos) && left_down {
-            let inner = ratatui::widgets::Block::default()
-                .borders(ratatui::widgets::Borders::ALL)
-                .inner(area);
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(1), // warning
-                    Constraint::Length(2), // name
-                    Constraint::Length(1), // spacer
-                    Constraint::Length(1), // buttons
-                    Constraint::Min(0),
-                ])
-                .split(inner);
-
-            if chunks[3].contains(pos) {
-                let button_chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                    .split(chunks[3]);
-
-                if button_chunks[0].contains(pos) {
-                    if let Some(path) = app.gist_to_delete.take() {
-                        let _ = tx.send(Message::DeleteGist(path));
-                    }
-                    app.show_delete_confirm = false;
-                } else if button_chunks[1].contains(pos) {
-                    app.show_delete_confirm = false;
-                    app.gist_to_delete = None;
+        let rects = modals::delete_confirm_layout(size);
+        if rects.modal_area.contains(pos) && left_down {
+            if rects.yes_button.contains(pos) {
+                if let Some(path) = app.gist_to_delete.take() {
+                    let _ = tx.send(Message::DeleteGist(path));
                 }
+                app.show_delete_confirm = false;
+            } else if rects.no_button.contains(pos) {
+                app.show_delete_confirm = false;
+                app.gist_to_delete = None;
             }
         }
         return;
     }
 
     if app.show_settings_modal {
-        let area = modals::centered_rect_fixed(100, 26, size);
-        if area.contains(pos) {
-            let inner_area = ratatui::widgets::Block::default()
-                .borders(ratatui::widgets::Borders::ALL)
-                .inner(area);
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .margin(1)
-                .constraints([
-                    Constraint::Length(1), // Header
-                    Constraint::Length(2), // Device Flow
-                    Constraint::Length(1), // PAT Header
-                    Constraint::Length(3), // PAT Input
-                    Constraint::Length(1), // Status
-                    Constraint::Length(1), // Spacer
-                    Constraint::Length(1), // Update URL Header
-                    Constraint::Length(3), // Update URL Input
-                    Constraint::Length(1), // Update Warning
-                    Constraint::Length(1), // Update Button
-                    Constraint::Length(1), // Spacer
-                    Constraint::Length(1), // Editor Header
-                    Constraint::Length(3), // Editor Input
-                    Constraint::Min(0),
-                ])
-                .split(inner_area);
-
+        let rects = modals::settings_layout(size);
+        if rects.modal_area.contains(pos) {
             let focus = |app: &mut App, pat: bool, url: bool, editor: bool| {
                 app.is_pat_focused = pat;
                 app.is_update_url_focused = url;
                 app.is_editor_focused = editor;
             };
-            if chunks[3].contains(pos) {
+            if rects.device_flow_or_login.contains(pos) && left_down {
+                if !app.device_flow_running && app.auth_token.is_none() {
+                    start_device_flow(app, tx);
+                }
+                return;
+            }
+            if rects.clear_token_button.contains(pos) && left_down {
+                if app.auth_token.is_some() || !app.pat_input.is_empty() {
+                    app.auth_token = None;
+                    app.pat_input.clear();
+                    app.config.auth.personal_access_token = None;
+                    crate::try_save_config(app);
+                    app.set_github_status("✓ Token cleared / Logged out", false, 4);
+                }
+                return;
+            }
+            if rects.pat_input.contains(pos) {
                 if left_down {
                     focus(app, true, false, false);
                 }
                 return;
             }
-            if chunks[7].contains(pos) {
+            if rects.update_url_input.contains(pos) {
                 if left_down {
                     focus(app, false, true, false);
                 }
                 return;
             }
-            if chunks[9].contains(pos) {
+            if rects.update_button.contains(pos) {
                 if left_down && app.update_disabled_reason.is_none() {
                     let _ = tx.send(Message::UpdateBinary);
                 }
                 return;
             }
-            if chunks[12].contains(pos) {
+            if rects.editor_input.contains(pos) {
                 if left_down {
                     focus(app, false, false, true);
                 }
@@ -239,7 +234,7 @@ pub fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sen
             app.is_pat_focused = false;
             app.is_update_url_focused = false;
             app.is_editor_focused = false;
-            if !area.contains(pos) {
+            if !rects.modal_area.contains(pos) {
                 app.show_settings_modal = false;
             }
         }
@@ -247,7 +242,7 @@ pub fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sen
     }
 
     let (mouse_mode, mouse_enc, alt_screen, app_cursor) = {
-        let parser = app.parser.lock().unwrap();
+        let parser = app.lock_parser();
         let screen = parser.screen();
         (
             screen.mouse_protocol_mode(),
@@ -317,6 +312,10 @@ pub fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sen
                 if !chunk.contains(pos) {
                     continue;
                 }
+                if item.type_ == ItemType::GithubStatus && !app.unsynced_files.is_empty() {
+                    let _ = tx.send(Message::UploadUnsynced);
+                    return;
+                }
                 let Some(action) = item.action else {
                     continue;
                 };
@@ -325,8 +324,12 @@ pub fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sen
                     ActionType::CopySelection => app.copy_selection(),
                     ActionType::SendCommand => {
                         if let Some(cmd) = item.command {
-                            let line = send_command_line(&cmd);
-                            write_pty(app, line.as_bytes());
+                            if cmd.contains("<prompt:") {
+                                app.open_prompt_dialog(&cmd);
+                            } else {
+                                let line = send_command_line(&cmd);
+                                write_pty(app, line.as_bytes());
+                            }
                         }
                     }
                     ActionType::Quit => app.should_quit = true,
@@ -344,12 +347,12 @@ pub fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sen
                             if let Some(token) = &app.auth_token {
                                 app.pat_input = token.clone();
                             } else {
-                                start_device_flow(app, tx);
+                                app.pat_input = String::new();
                             }
                         }
                     }
                     ActionType::FetchGists => {
-                        let _ = tx.send(Message::FetchGists);
+                        let _ = tx.send(Message::FetchGists { switch_tab: true });
                     }
                 }
                 return;
@@ -357,25 +360,17 @@ pub fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sen
         }
     }
 
-    let is_app_active = alt_screen || app_cursor || {
-        let parser = app.parser.lock().unwrap();
-        parser.screen().hide_cursor()
-    };
-    let is_sidebar_locked = is_app_active || app.is_pty_busy;
-
+    let is_sidebar_locked = crate::ui::sidebar::is_sidebar_locked(app);
     let sa = layout.sidebar_area;
-    let tabs_area = Rect::new(sa.x, sa.y, sa.width, 1);
-    let search_area = Rect::new(sa.x, sa.y + 1, sa.width, 1);
-    let show_new_button = app.sidebar_mode == SidebarMode::Gists && !is_sidebar_locked;
-    let list_area = Rect::new(
-        sa.x,
-        sa.y + 2,
-        sa.width,
-        sa.height.saturating_sub(if show_new_button { 3 } else { 2 }),
+    let s_rects = crate::ui::sidebar::sidebar_layout(
+        sa,
+        app.sidebar_mode == SidebarMode::Gists,
+        is_sidebar_locked,
     );
-    let new_button_area = show_new_button.then(|| {
-        Rect::new(sa.x, sa.y + sa.height.saturating_sub(1), sa.width, 1)
-    });
+    let tabs_area = s_rects.tabs;
+    let search_area = s_rects.search;
+    let list_area = s_rects.list;
+    let new_button_area = s_rects.new_button;
 
     if sa.contains(pos) || layout.sidebar_scrollbar_area.contains(pos) {
         if is_sidebar_locked {
@@ -411,6 +406,7 @@ pub fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sen
                     app.sidebar_mode = SidebarMode::Gists;
                 }
                 app.sidebar_state.select(Some(0));
+                app.recompute_filtered_indices();
             }
             return;
         }
@@ -457,13 +453,57 @@ pub fn handle_click(app: &mut App, mouse: MouseEvent, size: Rect, tx: &mpsc::Sen
         let cell = (ty.min(max_row), tx_.min(max_col));
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                app.is_selecting = true;
-                app.selection_start = Some(cell);
-                app.selection_end = Some(cell);
+                let now = Instant::now();
+                let is_repeat = app.last_term_click_cell == Some(cell)
+                    && app
+                        .last_term_click_time
+                        .is_some_and(|t| now.duration_since(t) < Duration::from_millis(350));
+
+                let count = if is_repeat {
+                    app.term_click_count = (app.term_click_count % 3) + 1;
+                    app.term_click_count
+                } else {
+                    app.term_click_count = 1;
+                    1
+                };
+                app.last_term_click_time = Some(now);
+                app.last_term_click_cell = Some(cell);
+
+                if count == 2 {
+                    // Double click: select word
+                    let mut start_c = cell.1;
+                    let mut end_c = cell.1;
+                    {
+                        let parser = app.lock_parser();
+                        let screen = parser.screen();
+                        let is_word_char = |c: u16| {
+                            screen.cell(cell.0, c).is_some_and(|cell| {
+                                cell.has_contents()
+                                    && !cell.contents().chars().any(|ch| ch.is_whitespace())
+                            })
+                        };
+                        while start_c > 0 && is_word_char(start_c - 1) {
+                            start_c -= 1;
+                        }
+                        while end_c < max_col && is_word_char(end_c + 1) {
+                            end_c += 1;
+                        }
+                    }
+                    app.is_selecting = false;
+                    app.selection_start = Some((cell.0, start_c));
+                    app.selection_end = Some((cell.0, end_c));
+                } else if count == 3 {
+                    // Triple click: select full line
+                    app.is_selecting = false;
+                    app.selection_start = Some((cell.0, 0));
+                    app.selection_end = Some((cell.0, max_col));
+                } else {
+                    app.is_selecting = true;
+                    app.selection_start = Some(cell);
+                    app.selection_end = Some(cell);
+                }
             }
-            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved
-                if app.is_selecting =>
-            {
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved if app.is_selecting => {
                 app.selection_end = Some(cell);
             }
             MouseEventKind::Up(MouseButton::Left) if app.is_selecting => {
@@ -521,7 +561,10 @@ fn handle_list_mouse(app: &mut App, mouse: MouseEvent, list_area: Rect) {
             if is_double_click {
                 app.last_click_time = None;
                 app.last_clicked_index = None;
-                if let Some(path) = entry.path.as_ref().filter(|_| entry.kind != EntryKind::History)
+                if let Some(path) = entry
+                    .path
+                    .as_ref()
+                    .filter(|_| entry.kind != EntryKind::History)
                 {
                     if let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified()) {
                         app.editing_file = Some((path.clone(), mtime));
@@ -544,7 +587,9 @@ fn handle_list_mouse(app: &mut App, mouse: MouseEvent, list_area: Rect) {
             if is_delete_click {
                 app.show_delete_confirm = true;
                 app.gist_to_delete = entry.path.clone();
-            } else if x <= 1 {
+            } else if entry.command.contains("<prompt:") {
+                app.open_prompt_dialog(&entry.command);
+            } else {
                 let line = run_line(&entry);
                 write_pty(app, line.as_bytes());
             }
@@ -572,9 +617,35 @@ mod tests {
     }
 
     #[test]
+    fn run_line_keeps_working_when_current_exe_ends_in_deleted() {
+        let deleted_exe = Path::new("/usr/local/bin/termbookman (deleted)");
+        assert_eq!(
+            sanitize_exe_path(deleted_exe),
+            PathBuf::from("/usr/local/bin/termbookman")
+        );
+        let line = run_line_with_exe(
+            &entry(EntryKind::Command, Some("/commands.txt"), "key"),
+            deleted_exe,
+        );
+        assert!(
+            line.starts_with("'/usr/local/bin/termbookman' run")
+                || line.starts_with("/usr/local/bin/termbookman run")
+        );
+        assert!(!line.contains("(deleted)"));
+    }
+
+    #[test]
     fn run_line_references_file_and_key_with_quoting() {
-        let line = run_line(&entry(EntryKind::Command, Some("/home/a b/commands.txt"), "it's"));
-        assert!(line.ends_with(" run '/home/a b/commands.txt' 'it'\\''s'\r"), "{}", line);
+        let line = run_line(&entry(
+            EntryKind::Command,
+            Some("/home/a b/commands.txt"),
+            "it's",
+        ));
+        assert!(
+            line.ends_with(" run '/home/a b/commands.txt' 'it'\\''s'\r"),
+            "{}",
+            line
+        );
         assert!(line.starts_with(&exe_word()));
     }
 
@@ -587,6 +658,70 @@ mod tests {
     fn send_command_line_only_wraps_prompt_commands() {
         assert_eq!(send_command_line("git status\r"), "git status\r");
         let wrapped = send_command_line("ssh <prompt:Host>\r");
-        assert!(wrapped.ends_with(" exec 'ssh <prompt:Host>'\r"), "{}", wrapped);
+        assert!(
+            wrapped.ends_with(" exec 'ssh <prompt:Host>'\r"),
+            "{}",
+            wrapped
+        );
+    }
+
+    #[test]
+    fn terminal_double_click_selects_word_and_triple_click_selects_line() {
+        use std::sync::{Arc, Mutex};
+        let pty_system = portable_pty::native_pty_system();
+        let pair = pty_system
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        {
+            let mut p = parser.lock().unwrap();
+            p.process(b"echo 'hello-world' 123\r\n");
+        }
+
+        let mut app = App::new(
+            Box::new(std::io::sink()),
+            pair.master,
+            parser,
+            Vec::new(),
+            std::process::id(),
+        );
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let size = Rect::new(0, 0, 100, 24);
+
+        // First click on row 0, col 7 ('h' in 'hello-world')
+        let click_event = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 7,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_click(&mut app, click_event, size, &tx);
+        assert_eq!(app.term_click_count, 1);
+        assert_eq!(app.selection_start, Some((0, 7)));
+
+        // Double click at same cell within 350ms
+        handle_click(&mut app, click_event, size, &tx);
+        assert_eq!(app.term_click_count, 2);
+        // The word "'hello-world'" should be selected (from col 5 to col 17)
+        assert_eq!(app.selection_start, Some((0, 5)));
+        assert_eq!(app.selection_end, Some((0, 17)));
+
+        // Triple click at same cell
+        handle_click(&mut app, click_event, size, &tx);
+        assert_eq!(app.term_click_count, 3);
+        // Full line should be selected (col 0 to max_col of term_area)
+        let max_col = crate::ui::calculate_layout(size, crate::DEFAULT_SIDEBAR_WIDTH)
+            .term_area
+            .width
+            .saturating_sub(1);
+        assert_eq!(app.selection_start, Some((0, 0)));
+        assert_eq!(app.selection_end, Some((0, max_col)));
     }
 }

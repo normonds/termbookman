@@ -8,7 +8,7 @@ use ratatui::Frame;
 
 pub fn render_terminal(f: &mut Frame, app: &mut App, area: Rect, scrollbar_area: Rect) {
     {
-        let mut parser = app.parser.lock().unwrap();
+        let mut parser = app.lock_parser();
         let (p_rows, p_cols) = parser.screen().size();
         if area.height != p_rows || area.width != p_cols {
             let _ = app.master.resize(PtySize {
@@ -36,7 +36,7 @@ pub fn render_terminal(f: &mut Frame, app: &mut App, area: Rect, scrollbar_area:
     }
 
     {
-        let parser = app.parser.lock().unwrap();
+        let parser = app.lock_parser();
         let screen = parser.screen();
 
         for row in 0..area.height {
@@ -69,7 +69,7 @@ pub fn render_terminal(f: &mut Frame, app: &mut App, area: Rect, scrollbar_area:
                         _ => {}
                     }
 
-                    if cell.bold() {
+                    if cell.bold() || cell.blink() {
                         style = style.add_modifier(Modifier::BOLD);
                     }
                     if cell.dim() {
@@ -83,6 +83,9 @@ pub fn render_terminal(f: &mut Frame, app: &mut App, area: Rect, scrollbar_area:
                     }
                     if cell.underline() {
                         style = style.add_modifier(Modifier::UNDERLINED);
+                    }
+                    if cell.strikethrough() {
+                        style = style.add_modifier(Modifier::CROSSED_OUT);
                     }
 
                     if let (Some(start), Some(end)) = (app.selection_start, app.selection_end) {

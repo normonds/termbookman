@@ -81,7 +81,12 @@ fn run_tui() -> Result<(), Box<dyn Error>> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -113,18 +118,52 @@ fn run_app(
         pixel_height: 0,
     })?;
 
-    let mut cmd = CommandBuilder::new("bash");
+    let (early_cfg, _) = config::load_config();
+    let shell_prog = early_cfg
+        .shell
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("SHELL").ok())
+        .unwrap_or_else(|| "bash".to_string());
+    let mut cmd = CommandBuilder::new(&shell_prog);
     cmd.cwd(app::initial_shell_dir(exe_dir));
     cmd.env("TERM", "xterm-256color");
-    cmd.env("LANG", "C.UTF-8");
+    let current_lang = std::env::var("LANG").unwrap_or_default();
+    if !current_lang.to_lowercase().contains("utf-8")
+        && !current_lang.to_lowercase().contains("utf8")
+    {
+        cmd.env("LANG", "C.UTF-8");
+    }
     cmd.env("COLORTERM", "truecolor");
+    cmd.env("TERMBOOKMAN", "1");
+    if shell_prog.ends_with("bash") || shell_prog == "bash" {
+        let existing = std::env::var("PROMPT_COMMAND").unwrap_or_default();
+        let prompt_cmd = if existing.contains("history -a") {
+            existing
+        } else if existing.trim().is_empty() {
+            "history -a".to_string()
+        } else {
+            format!("history -a; {existing}")
+        };
+        cmd.env("PROMPT_COMMAND", prompt_cmd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        cmd.env(
+            "TERMBOOKMAN_BIN",
+            crate::handlers::sanitize_exe_path(&exe)
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
     let mut child = pair.slave.spawn_command(cmd)?;
 
     let mut reader = pair.master.try_clone_reader()?;
     let pty_write = pair.master.take_writer()?;
     let master = pair.master;
 
-    let parser = Arc::new(Mutex::new(Parser::new(rows, cols, 1000)));
+    let scrollback = early_cfg.scrollback.max(100);
+    let parser = Arc::new(Mutex::new(Parser::new(rows, cols, scrollback)));
     let parser_clone = Arc::clone(&parser);
 
     let (tx, rx) = mpsc::channel();
@@ -137,7 +176,12 @@ fn run_app(
         loop {
             match reader.read(&mut buffer) {
                 Ok(n) if n > 0 => {
-                    parser_clone.lock().unwrap().process(&buffer[..n]);
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        parser_clone
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .process(&buffer[..n]);
+                    }));
                     if pty_tx.send(Message::PtyData).is_err() {
                         break;
                     }
@@ -171,8 +215,12 @@ fn run_app(
     );
     app.sidebar_width = DEFAULT_SIDEBAR_WIDTH;
 
+    if let Some(ref err) = app.config_error {
+        app.set_github_status(format!("⚠ {}", err), true, 15);
+    }
+
     if app.auth_token.is_some() {
-        let _ = tx.send(Message::FetchGists);
+        let _ = tx.send(Message::FetchGists { switch_tab: false });
     }
 
     let mut sys = System::new_all();
@@ -191,6 +239,7 @@ fn run_app(
         let animating = app.is_search_focused
             || app.loading_gist
             || app.show_new_gist_dialog
+            || app.prompt_state.is_some()
             || app.is_pat_focused
             || app.is_editor_focused
             || app.is_update_url_focused;
@@ -222,12 +271,29 @@ fn run_app(
     Ok(())
 }
 
+pub fn try_save_config(app: &mut App) {
+    if let Some(err) = app.config_error.clone() {
+        app.set_github_status(
+            "Refusing to save: config.toml has parse error (backup in config.toml.bak)",
+            true,
+            10,
+        );
+        log_debug(&format!("Refusing to save config: {}", err));
+        return;
+    }
+    if let Err(e) = save_config(&app.config) {
+        app.set_github_status(format!("✗ Failed to save config: {}", e), true, 8);
+        log_debug(&format!("Failed to save config: {}", e));
+    }
+}
+
 fn spawn_upload(
     tx: &mpsc::Sender<Message>,
     token: String,
     path: PathBuf,
     remote_name: String,
     gist_id: Option<String>,
+    expected_hash: Option<String>,
     verb: &'static str,
 ) {
     let tx = tx.clone();
@@ -247,7 +313,13 @@ fn spawn_upload(
             format!("[{}: {}]", verb, remote_name),
             true,
         ));
-        match github::upload_gist(&token, &content, &remote_name, gist_id.as_deref()) {
+        match github::upload_gist(
+            &token,
+            &content,
+            &remote_name,
+            gist_id.as_deref(),
+            expected_hash.as_deref(),
+        ) {
             Ok(id) => {
                 log_debug(&format!("✓ {} succeeded: {}", verb, remote_name));
                 let _ = tx.send(Message::GistUploaded(path, content, id));
@@ -269,16 +341,33 @@ fn spawn_upload(
 
 /// Applies a key press to a single-line text input. Returns true on Enter.
 fn edit_text(input: &mut String, key: &KeyEvent) -> bool {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('u') => {
+                input.clear();
+                return false;
+            }
+            KeyCode::Char('w') => {
+                let trimmed =
+                    input.trim_end_matches(|c: char| c.is_whitespace() || c == '/' || c == '-');
+                if let Some(pos) =
+                    trimmed.rfind(|c: char| c.is_whitespace() || c == '/' || c == '-')
+                {
+                    input.truncate(pos + 1);
+                } else {
+                    input.clear();
+                }
+                return false;
+            }
+            _ => return false,
+        }
+    }
     match key.code {
-        KeyCode::Backspace => {
+        KeyCode::Backspace | KeyCode::Delete => {
             input.pop();
         }
-        KeyCode::Char(c)
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
-            input.push(c)
+        KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::ALT) => {
+            input.push(c);
         }
         KeyCode::Enter => return true,
         _ => {}
@@ -288,7 +377,9 @@ fn edit_text(input: &mut String, key: &KeyEvent) -> bool {
 
 /// The text input that currently has keyboard focus, if any.
 fn focused_input(app: &mut App) -> Option<&mut String> {
-    if app.show_new_gist_dialog {
+    if let Some(prompt) = &mut app.prompt_state {
+        Some(&mut prompt.current_input)
+    } else if app.show_new_gist_dialog {
         Some(&mut app.new_gist_name_input)
     } else if app.show_settings_modal && app.is_pat_focused {
         Some(&mut app.pat_input)
@@ -314,21 +405,35 @@ fn handle_message(
         Message::PtyData => {
             // Just wake up to redraw
         }
+        Message::GitInfo(info) => {
+            app.git_info = info;
+            app.git_query_running = false;
+        }
         Message::Tick => {
-            if let Some(path) = app.update_stats(sys) {
+            if let Some(path) = app.update_stats(sys, tx) {
                 if let Some(token) = app.auth_token.clone() {
                     let dir = gist_dir();
-                    let gist_id = gists::Manifest::load(&dir).gist_id(&dir, &path);
+                    let manifest = gists::Manifest::load(&dir);
+                    let gist_id = manifest.gist_id(&dir, &path);
+                    let expected_hash = manifest.get(&dir, &path).map(|e| e.hash.clone());
                     let remote_name = app
-                        .gist_entries
-                        .iter()
-                        .chain(app.sidebar_entries.iter())
-                        .find(|e| e.path.as_ref() == Some(&path))
+                        .find_entry_by_path(&path)
                         .and_then(|e| e.remote_name.clone())
                         .unwrap_or_else(|| {
-                            path.file_name().unwrap_or_default().to_string_lossy().into_owned()
+                            path.file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned()
                         });
-                    spawn_upload(tx, token, path, remote_name, gist_id, "Auto-upload");
+                    spawn_upload(
+                        tx,
+                        token,
+                        path,
+                        remote_name,
+                        gist_id,
+                        expected_hash,
+                        "Auto-upload",
+                    );
                 }
             }
 
@@ -339,13 +444,16 @@ fn handle_message(
                         (app.auth_token.clone(), app.commands_txt_path.clone())
                     {
                         let dir = gist_dir();
-                        let gist_id = gists::Manifest::load(&dir).gist_id(&dir, &cmd_path);
+                        let manifest = gists::Manifest::load(&dir);
+                        let gist_id = manifest.gist_id(&dir, &cmd_path);
+                        let expected_hash = manifest.get(&dir, &cmd_path).map(|e| e.hash.clone());
                         spawn_upload(
                             tx,
                             token,
                             cmd_path,
                             "commands.txt".to_string(),
                             gist_id,
+                            expected_hash,
                             "commands.txt sync",
                         );
                     }
@@ -367,9 +475,8 @@ fn handle_message(
             let client_id = app.config.auth.github_client_id.clone().unwrap_or_default();
             let cancel = Arc::clone(&app.device_flow_cancel);
             std::thread::spawn(move || {
-                let result = github::poll_device_token(&client_id, &code, || {
-                    cancel.load(Ordering::Relaxed)
-                });
+                let result =
+                    github::poll_device_token(&client_id, &code, || cancel.load(Ordering::Relaxed));
                 let _ = tx.send(match result {
                     Ok(token) => Message::AuthSuccess(token),
                     Err(e) => Message::AuthError(e),
@@ -384,11 +491,11 @@ fn handle_message(
             app.auth_token = Some(token.clone());
             app.pat_input = token.clone();
             app.config.auth.personal_access_token = Some(token);
-            let _ = save_config(&app.config);
+            try_save_config(app);
             app.show_settings_modal = false;
             app.login_error = None;
             app.github_user_code = None;
-            let _ = tx.send(Message::FetchGists);
+            let _ = tx.send(Message::FetchGists { switch_tab: true });
         }
         Message::AuthError(err) => {
             log_debug(&format!("✗ GitHub login error: {}", err));
@@ -400,7 +507,7 @@ fn handle_message(
             app.loading_gist = false;
             app.set_github_status(format!("✗ Gist fetch failed: {}", err), true, 8);
         }
-        Message::FetchGists => {
+        Message::FetchGists { switch_tab } => {
             let Some(token) = app.auth_token.clone() else {
                 app.login_error = Some("Not logged in to GitHub.".to_string());
                 app.show_settings_modal = true;
@@ -415,56 +522,85 @@ fn handle_message(
             let tx = tx.clone();
             std::thread::spawn(move || {
                 let _ = tx.send(match gists::fetch_all(&token, &gist_dir()) {
-                    Ok((entries, kept)) => Message::GistsFetched(entries, kept),
+                    Ok((entries, kept)) => Message::GistsFetched(entries, kept, switch_tab),
                     Err(e) => Message::GistFetchError(e),
                 });
             });
         }
         Message::DeleteGist(path) => {
             let dir = gist_dir();
-            let entry = app
-                .gist_entries
-                .iter()
-                .chain(app.sidebar_entries.iter())
-                .find(|e| e.path.as_ref() == Some(&path))
-                .cloned();
-            let remote_name = entry
-                .and_then(|e| e.remote_name)
-                .unwrap_or_else(|| path.file_name().unwrap_or_default().to_string_lossy().into_owned());
+            let entry = app.find_entry_by_path(&path).cloned();
+            let remote_name = entry.and_then(|e| e.remote_name).unwrap_or_else(|| {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            });
             let gist_id = gists::Manifest::load(&dir).gist_id(&dir, &path);
 
-            let _ = std::fs::remove_file(&path);
-            gists::with_manifest(&dir, |m| m.remove(&dir, &path));
-            app.gist_entries.retain(|e| e.path.as_ref() != Some(&path));
-            app.sidebar_entries.retain(|e| e.path.as_ref() != Some(&path));
-            let len = app.filtered_indices().len();
-            if app.sidebar_state.selected().is_some_and(|s| s >= len) {
-                app.sidebar_state.select(Some(len.saturating_sub(1)));
-            }
-
-            // Only touch GitHub when we know which gist the file belongs to; a script that was
-            // never uploaded exists only locally, and matching by name could hit another gist.
             match (app.auth_token.clone(), gist_id) {
                 (Some(token), Some(gist_id)) => {
                     let tx = tx.clone();
                     std::thread::spawn(move || {
-                        log_debug(&format!("Deleting gist file: {}", remote_name));
+                        log_debug(&format!("Deleting remote gist file: {}", remote_name));
                         let _ = tx.send(Message::GistUploadStatus(
                             format!("[Deleting: {}]", remote_name),
                             true,
                         ));
-                        let msg = match github::delete_gist_file(&token, Some(&gist_id), &remote_name) {
+                        match github::delete_gist_file(&token, Some(&gist_id), &remote_name) {
                             Ok(github::DeletePlan::RemoveFile) => {
-                                (format!("✓ Removed {} from its gist", remote_name), true)
+                                let _ = tx.send(Message::GistUploadStatus(
+                                    format!("✓ Removed {} from its gist", remote_name),
+                                    true,
+                                ));
+                                let _ = tx.send(Message::GistDeletedLocally(path));
                             }
-                            Ok(_) => (format!("✓ Gist deleted: {}", remote_name), true),
-                            Err(e) => (format!("✗ Gist deletion failed: {}", e), false),
-                        };
-                        log_debug(&msg.0);
-                        let _ = tx.send(Message::GistUploadStatus(msg.0, msg.1));
+                            Ok(_) => {
+                                let _ = tx.send(Message::GistUploadStatus(
+                                    format!("✓ Gist deleted: {}", remote_name),
+                                    true,
+                                ));
+                                let _ = tx.send(Message::GistDeletedLocally(path));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Message::GistUploadStatus(
+                                    format!("✗ Remote delete failed: {}; local file kept", e),
+                                    false,
+                                ));
+                            }
+                        }
                     });
                 }
-                _ => app.set_github_status(format!("✓ Deleted local file {}", remote_name), false, 4),
+                _ => {
+                    let _ = std::fs::remove_file(&path);
+                    gists::with_manifest(&dir, |m| m.remove(&dir, &path));
+                    app.gist_entries.retain(|e| e.path.as_ref() != Some(&path));
+                    app.sidebar_entries
+                        .retain(|e| e.path.as_ref() != Some(&path));
+                    app.recompute_filtered_indices();
+                    let len = app.filtered_indices().len();
+                    if app.sidebar_state.selected().is_some_and(|s| s >= len) {
+                        app.sidebar_state.select(Some(len.saturating_sub(1)));
+                    }
+                    app.set_github_status(
+                        format!("✓ Deleted local file {}", remote_name),
+                        false,
+                        4,
+                    );
+                }
+            }
+        }
+        Message::GistDeletedLocally(path) => {
+            let dir = gist_dir();
+            let _ = std::fs::remove_file(&path);
+            gists::with_manifest(&dir, |m| m.remove(&dir, &path));
+            app.gist_entries.retain(|e| e.path.as_ref() != Some(&path));
+            app.sidebar_entries
+                .retain(|e| e.path.as_ref() != Some(&path));
+            app.recompute_filtered_indices();
+            let len = app.filtered_indices().len();
+            if app.sidebar_state.selected().is_some_and(|s| s >= len) {
+                app.sidebar_state.select(Some(len.saturating_sub(1)));
             }
         }
         Message::CreateNewGist => {
@@ -509,41 +645,90 @@ fn handle_message(
             );
         }
         Message::UpdateBinary => {
+            if app.is_updating {
+                return;
+            }
+            app.is_updating = true;
             let update_url = app.update_url_input.clone();
             let tx = tx.clone();
             std::thread::spawn(move || {
                 let progress = |msg: String| {
                     let _ = tx.send(Message::GistUploadStatus(msg, true));
                 };
-                let _ = tx.send(match updater::run_update(&update_url, progress) {
-                    Ok(()) => Message::GistUploadStatus(
-                        "✓ Update successful! Please restart the app.".to_string(),
-                        true,
-                    ),
-                    Err(e) => Message::GistUploadStatus(format!("✗ Update failed: {}", e), false),
-                });
+                let res = updater::run_update(&update_url, progress);
+                let _ = tx.send(Message::UpdateFinished(res));
             });
         }
-        Message::GistsFetched(entries, kept) => {
-            log_debug(&format!("Gists fetched successfully: {} items", entries.len()));
+        Message::UpdateFinished(res) => {
+            app.is_updating = false;
+            let msg = match res {
+                Ok(()) => Message::GistUploadStatus(
+                    "✓ Update check finished (see status above)".to_string(),
+                    true,
+                ),
+                Err(e) => Message::GistUploadStatus(format!("✗ Update failed: {}", e), false),
+            };
+            let _ = tx.send(msg);
+        }
+        Message::GistsFetched(entries, kept, switch_tab) => {
+            log_debug(&format!(
+                "Gists fetched successfully: {} items",
+                entries.len()
+            ));
             app.loading_gist = false;
             if kept.is_empty() {
                 app.set_github_status("✓ Gists loaded", false, 3);
             } else {
                 app.set_github_status(
-                    format!("✓ Gists loaded; kept local edits (not uploaded): {}", kept.join(", ")),
+                    format!(
+                        "✓ Gists loaded; kept local edits (not uploaded): {}",
+                        kept.join(", ")
+                    ),
                     false,
                     10,
                 );
             }
             app.gist_entries = entries;
-            app.sidebar_mode = app::SidebarMode::Gists;
-            app.sidebar_state.select(Some(0));
+            if switch_tab {
+                app.sidebar_mode = app::SidebarMode::Gists;
+                app.sidebar_state.select(Some(0));
+            }
             app.reload_sidebar();
         }
         Message::GistUploadStatus(msg, is_success) => {
             let secs = if is_success { 4 } else { 8 };
             app.set_github_status(&msg, !is_success, secs);
+        }
+        Message::UploadUnsynced => {
+            if let Some(token) = app.auth_token.clone() {
+                let dir = gist_dir();
+                let manifest = gists::Manifest::load(&dir);
+                let files = app.unsynced_files.clone();
+                for path in files {
+                    let gist_id = manifest.gist_id(&dir, &path);
+                    let expected_hash = manifest.get(&dir, &path).map(|e| e.hash.clone());
+                    let remote_name = app
+                        .find_entry_by_path(&path)
+                        .and_then(|e| e.remote_name.clone())
+                        .unwrap_or_else(|| {
+                            path.file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned()
+                        });
+                    spawn_upload(
+                        tx,
+                        token.clone(),
+                        path,
+                        remote_name,
+                        gist_id,
+                        expected_hash,
+                        "Sync unsynced edits",
+                    );
+                }
+            } else {
+                app.set_github_status("✗ Cannot upload: no GitHub token configured", true, 6);
+            }
         }
         Message::Event(event) => handle_event(app, event, tx, size),
     }
@@ -570,7 +755,7 @@ fn handle_event(app: &mut App, event: Event, tx: &mpsc::Sender<Message>, size: R
             if key.modifiers.contains(KeyModifiers::SHIFT)
                 && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
             {
-                let mut p = app.parser.lock().unwrap();
+                let mut p = app.lock_parser();
                 let current = p.screen().scrollback();
                 let target = if key.code == KeyCode::PageUp {
                     current + 20
@@ -603,6 +788,35 @@ fn handle_event(app: &mut App, event: Event, tx: &mpsc::Sender<Message>, size: R
                 return;
             }
 
+            if let Some(prompt) = &mut app.prompt_state {
+                if key.code == KeyCode::Esc {
+                    app.prompt_state = None;
+                } else if edit_text(&mut prompt.current_input, &key) {
+                    let answer = prompt.current_input.clone();
+                    prompt.answers.push(answer);
+                    prompt.current_idx += 1;
+                    if prompt.current_idx < prompt.prompts.len() {
+                        prompt.current_input = prompt.prompts[prompt.current_idx].1.clone();
+                    } else {
+                        let template = prompt.template.clone();
+                        let mut answers_iter = prompt.answers.clone().into_iter();
+                        let final_cmd =
+                            crate::utils::substitute_prompts(&template, |_label, _default| {
+                                answers_iter.next().unwrap_or_default()
+                            });
+                        app.prompt_state = None;
+                        let line = if final_cmd.ends_with('\r') || final_cmd.ends_with('\n') {
+                            final_cmd
+                        } else {
+                            format!("{}\r", final_cmd)
+                        };
+                        let _ = app.pty_write.write_all(line.as_bytes());
+                        let _ = app.pty_write.flush();
+                    }
+                }
+                return;
+            }
+
             if app.show_new_gist_dialog {
                 if key.code == KeyCode::Esc {
                     app.show_new_gist_dialog = false;
@@ -624,23 +838,32 @@ fn handle_event(app: &mut App, event: Event, tx: &mpsc::Sender<Message>, size: R
                         app.show_settings_modal = false;
                     }
                 } else if app.is_pat_focused {
-                    if edit_text(&mut app.pat_input, &key) && !app.pat_input.trim().is_empty() {
-                        let token = app.pat_input.trim().to_string();
-                        app.auth_token = Some(token.clone());
-                        app.config.auth.personal_access_token = Some(token);
-                        let _ = save_config(&app.config);
-                        app.is_pat_focused = false;
-                        app.login_error = None;
-                        // A manual token makes a pending device login pointless.
-                        app.device_flow_cancel.store(true, Ordering::Relaxed);
-                        let _ = tx.send(Message::FetchGists);
+                    if edit_text(&mut app.pat_input, &key) {
+                        let trimmed = app.pat_input.trim();
+                        if trimmed.is_empty() {
+                            app.auth_token = None;
+                            app.config.auth.personal_access_token = None;
+                            try_save_config(app);
+                            app.is_pat_focused = false;
+                            app.set_github_status("✓ Token cleared", false, 3);
+                        } else {
+                            let token = trimmed.to_string();
+                            app.auth_token = Some(token.clone());
+                            app.config.auth.personal_access_token = Some(token);
+                            try_save_config(app);
+                            app.is_pat_focused = false;
+                            app.login_error = None;
+                            // A manual token makes a pending device login pointless.
+                            app.device_flow_cancel.store(true, Ordering::Relaxed);
+                            let _ = tx.send(Message::FetchGists { switch_tab: true });
+                        }
                     }
                 } else if app.is_update_url_focused {
                     if edit_text(&mut app.update_url_input, &key)
                         && !app.update_url_input.trim().is_empty()
                     {
                         app.config.auth.update_url = app.update_url_input.trim().to_string();
-                        let _ = save_config(&app.config);
+                        try_save_config(app);
                         app.is_update_url_focused = false;
                     }
                 } else if app.is_editor_focused
@@ -648,7 +871,7 @@ fn handle_event(app: &mut App, event: Event, tx: &mpsc::Sender<Message>, size: R
                     && !app.editor_input.trim().is_empty()
                 {
                     app.config.external_editor = app.editor_input.trim().to_string();
-                    let _ = save_config(&app.config);
+                    try_save_config(app);
                     app.is_editor_focused = false;
                 }
                 return;
@@ -656,11 +879,138 @@ fn handle_event(app: &mut App, event: Event, tx: &mpsc::Sender<Message>, size: R
 
             if app.is_search_focused {
                 match key.code {
-                    KeyCode::Esc | KeyCode::Enter => app.is_search_focused = false,
+                    KeyCode::Esc => app.is_search_focused = false,
+                    KeyCode::Enter => {
+                        app.is_search_focused = false;
+                        if let Some(entry) = app.selected_entry().cloned() {
+                            let line = handlers::run_line(&entry);
+                            let _ = app.pty_write.write_all(line.as_bytes());
+                            let _ = app.pty_write.flush();
+                        }
+                    }
                     _ => {
                         edit_text(&mut app.search_query, &key);
+                        app.recompute_filtered_indices();
                         app.sidebar_state.select(Some(0));
                     }
+                }
+                return;
+            }
+
+            if key.code == KeyCode::F(2) {
+                app.is_sidebar_focused = !app.is_sidebar_focused;
+                return;
+            }
+
+            if app.is_sidebar_focused {
+                match key.code {
+                    KeyCode::Esc => app.is_sidebar_focused = false,
+                    KeyCode::Up => {
+                        let sel = app.sidebar_state.selected().unwrap_or(0);
+                        app.sidebar_state.select(Some(sel.saturating_sub(1)));
+                    }
+                    KeyCode::Down => {
+                        let len = app.filtered_indices().len();
+                        let sel = app.sidebar_state.selected().unwrap_or(0);
+                        if len > 0 {
+                            app.sidebar_state.select(Some((sel + 1).min(len - 1)));
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        let sel = app.sidebar_state.selected().unwrap_or(0);
+                        app.sidebar_state.select(Some(sel.saturating_sub(10)));
+                    }
+                    KeyCode::PageDown => {
+                        let len = app.filtered_indices().len();
+                        let sel = app.sidebar_state.selected().unwrap_or(0);
+                        if len > 0 {
+                            app.sidebar_state.select(Some((sel + 10).min(len - 1)));
+                        }
+                    }
+                    KeyCode::Home => app.sidebar_state.select(Some(0)),
+                    KeyCode::End => {
+                        let len = app.filtered_indices().len();
+                        if len > 0 {
+                            app.sidebar_state.select(Some(len - 1));
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(entry) = app.selected_entry().cloned() {
+                            if entry.command.contains("<prompt:") {
+                                app.open_prompt_dialog(&entry.command);
+                            } else {
+                                let line = handlers::run_line(&entry);
+                                let _ = app.pty_write.write_all(line.as_bytes());
+                                let _ = app.pty_write.flush();
+                            }
+                        }
+                    }
+                    KeyCode::Tab => {
+                        app.sidebar_mode = match app.sidebar_mode {
+                            app::SidebarMode::Commands => app::SidebarMode::History,
+                            app::SidebarMode::History => app::SidebarMode::Gists,
+                            app::SidebarMode::Gists => app::SidebarMode::Commands,
+                        };
+                        if app.sidebar_mode == app::SidebarMode::History {
+                            app.refresh_history();
+                        }
+                        app.sidebar_state.select(Some(0));
+                        app.recompute_filtered_indices();
+                    }
+                    KeyCode::Char('/') => {
+                        app.is_search_focused = true;
+                        app.is_sidebar_focused = false;
+                    }
+                    KeyCode::Delete => {
+                        if let Some(entry) = app.selected_entry().cloned() {
+                            if app::is_deletable(&entry) {
+                                if let Some(path) = entry.path {
+                                    app.gist_to_delete = Some(path);
+                                    app.show_delete_confirm = true;
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char('s') => {
+                        if app.sidebar_mode == app::SidebarMode::History {
+                            if let Some(entry) = app.selected_entry().cloned() {
+                                if let Some(cmd_path) = &app.commands_txt_path {
+                                    let line = format!("\n# {}\n{}\n", entry.label, entry.command);
+                                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open(cmd_path)
+                                    {
+                                        use std::io::Write;
+                                        let _ = file.write_all(line.as_bytes());
+                                        app.set_github_status(
+                                            format!("✓ Saved '{}' to commands.txt", entry.label),
+                                            false,
+                                            4,
+                                        );
+                                        app.reload_sidebar();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char('e') => {
+                        if let Some(entry) = app.selected_entry().cloned() {
+                            if let Some(path) = entry
+                                .path
+                                .as_ref()
+                                .filter(|_| entry.kind != crate::entry::EntryKind::History)
+                            {
+                                if let Ok(mtime) =
+                                    std::fs::metadata(path).and_then(|m| m.modified())
+                                {
+                                    app.editing_file = Some((path.clone(), mtime));
+                                }
+                                handlers::open_in_editor(app, path);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 return;
             }
@@ -670,10 +1020,13 @@ fn handle_event(app: &mut App, event: Event, tx: &mpsc::Sender<Message>, size: R
         Event::Paste(text) => {
             if let Some(input) = focused_input(app) {
                 input.extend(text.chars().filter(|c| !c.is_control()));
+                if app.is_search_focused {
+                    app.recompute_filtered_indices();
+                }
                 return;
             }
             let bracketed = {
-                let mut p = app.parser.lock().unwrap();
+                let mut p = app.lock_parser();
                 p.screen_mut().set_scrollback(0);
                 p.screen().bracketed_paste()
             };
@@ -698,6 +1051,16 @@ mod tests {
         let mut parser = Parser::new(2, 20, 0);
         parser.process(bytes);
         parser.screen().contents()
+    }
+
+    #[test]
+    fn vt100_patch_handles_strikethrough_and_blink() {
+        let mut parser = Parser::new(2, 20, 0);
+        parser.process(b"\x1b[9mstrike\x1b[29m \x1b[5mblink\x1b[25m");
+        let screen = parser.screen();
+        assert!(screen.cell(0, 0).unwrap().strikethrough());
+        assert!(!screen.cell(0, 7).unwrap().strikethrough());
+        assert!(screen.cell(0, 7).unwrap().blink());
     }
 
     #[test]
@@ -740,12 +1103,256 @@ mod tests {
     #[test]
     fn edit_text_ignores_control_chords() {
         let mut s = String::from("ab");
-        assert!(!edit_text(&mut s, &KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(!edit_text(
+            &mut s,
+            &KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        ));
         assert_eq!(s, "ab");
-        edit_text(&mut s, &KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT));
-        edit_text(&mut s, &KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-        edit_text(&mut s, &KeyEvent::new(KeyCode::Char('ā'), KeyModifiers::NONE));
+        edit_text(
+            &mut s,
+            &KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT),
+        );
+        edit_text(
+            &mut s,
+            &KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        edit_text(
+            &mut s,
+            &KeyEvent::new(KeyCode::Char('ā'), KeyModifiers::NONE),
+        );
         assert_eq!(s, "abā");
-        assert!(edit_text(&mut s, &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(edit_text(
+            &mut s,
+            &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+        ));
+    }
+
+    #[test]
+    fn edit_text_ctrl_u_clears_buffer() {
+        let mut s = String::from("hello world");
+        assert!(!edit_text(
+            &mut s,
+            &KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)
+        ));
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn edit_text_ctrl_w_deletes_last_word() {
+        let mut s = String::from("git checkout -b feature/test");
+        assert!(!edit_text(
+            &mut s,
+            &KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)
+        ));
+        assert_eq!(s, "git checkout -b feature/");
+
+        assert!(!edit_text(
+            &mut s,
+            &KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)
+        ));
+        assert_eq!(s, "git checkout -b ");
+
+        assert!(!edit_text(
+            &mut s,
+            &KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)
+        ));
+        assert_eq!(s, "git checkout -");
+
+        let mut single_word = String::from("singleword");
+        edit_text(
+            &mut single_word,
+            &KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(single_word, "");
+    }
+
+    #[test]
+    fn edit_text_backspace_and_delete_remove_character() {
+        let mut s = String::from("cat");
+        edit_text(&mut s, &KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(s, "ca");
+        edit_text(
+            &mut s,
+            &KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert_eq!(s, "c");
+    }
+
+    #[test]
+    fn edit_text_ignores_alt_modified_chars() {
+        let mut s = String::from("initial");
+        assert!(!edit_text(
+            &mut s,
+            &KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT)
+        ));
+        assert_eq!(s, "initial");
+    }
+
+    #[test]
+    fn test_backend_renders_sidebar_and_statusbar() {
+        use crate::entry::{Entry, EntryKind};
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Position;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let entries = vec![Entry {
+            label: "ping-test".into(),
+            key: "ping-test".into(),
+            command: "ping -c 1 1.1.1.1".into(),
+            info: "".into(),
+            kind: EntryKind::Command,
+            path: None,
+            mtime: None,
+            remote_name: None,
+        }];
+
+        let pty_system = portable_pty::native_pty_system();
+        let pair = pty_system
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+
+        let mut app = App::new(
+            Box::new(std::io::sink()),
+            pair.master,
+            Arc::new(Mutex::new(Parser::new(24, 80, 0))),
+            entries,
+            std::process::id(),
+        );
+
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let mut found_ping = false;
+        let mut found_commands_tab = false;
+        let mut found_status = false;
+
+        for y in 0..buffer.area.height {
+            let mut line = String::new();
+            for x in 0..buffer.area.width {
+                line.push_str(buffer.get(x, y).symbol());
+            }
+            if line.contains("ping-test") {
+                found_ping = true;
+            }
+            if line.contains("COMMANDS") {
+                found_commands_tab = true;
+            }
+            if line.contains("EXIT") || line.contains("LOG") || line.contains("CPU") {
+                found_status = true;
+            }
+        }
+
+        assert!(found_commands_tab, "Sidebar must render Commands tab");
+        assert!(found_ping, "Sidebar must render ping-test entry");
+        assert!(found_status, "Status bar must render status buttons/stats");
+
+        let layout = ui::calculate_layout(Rect::new(0, 0, 100, 30), app.sidebar_width);
+        let s_rects = ui::sidebar::sidebar_layout(layout.sidebar_area, false, false);
+        assert!(s_rects
+            .list
+            .contains(Position::new(layout.sidebar_area.x + 2, s_rects.list.y + 1)));
+    }
+
+    #[test]
+    fn handle_message_state_transitions() {
+        use crate::app::SidebarMode;
+        use crate::entry::{Entry, EntryKind};
+
+        let pty_system = portable_pty::native_pty_system();
+        let pair = pty_system
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+
+        let mut app = App::new(
+            Box::new(std::io::sink()),
+            pair.master,
+            Arc::new(Mutex::new(Parser::new(24, 80, 0))),
+            Vec::new(),
+            std::process::id(),
+        );
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut sys = sysinfo::System::new();
+        let size = Rect::new(0, 0, 100, 30);
+
+        // 1. GitInfo
+        app.git_query_running = true;
+        handle_message(
+            &mut app,
+            Message::GitInfo(Some("GIT: main (clean)".to_string())),
+            &tx,
+            &mut sys,
+            size,
+        );
+        assert_eq!(app.git_info.as_deref(), Some("GIT: main (clean)"));
+        assert!(!app.git_query_running);
+
+        // 2. AuthError
+        handle_message(
+            &mut app,
+            Message::AuthError("bad credentials".to_string()),
+            &tx,
+            &mut sys,
+            size,
+        );
+        assert_eq!(app.login_error.as_deref(), Some("bad credentials"));
+
+        // 3. GistsFetched with switch_tab = false (background fetch)
+        app.sidebar_mode = SidebarMode::Commands;
+        let test_gist = Entry {
+            label: "test_gist".to_string(),
+            key: "test_gist".to_string(),
+            command: "echo 1".to_string(),
+            info: "".to_string(),
+            kind: EntryKind::Script,
+            path: None,
+            mtime: None,
+            remote_name: None,
+        };
+        handle_message(
+            &mut app,
+            Message::GistsFetched(vec![test_gist.clone()], vec![], false),
+            &tx,
+            &mut sys,
+            size,
+        );
+        assert_eq!(app.sidebar_mode, SidebarMode::Commands);
+        assert_eq!(app.gist_entries.len(), 1);
+
+        // 4. GistsFetched with switch_tab = true (user-initiated fetch)
+        handle_message(
+            &mut app,
+            Message::GistsFetched(vec![test_gist], vec![], true),
+            &tx,
+            &mut sys,
+            size,
+        );
+        assert_eq!(app.sidebar_mode, SidebarMode::Gists);
+
+        // 5. AuthSuccess
+        app.show_settings_modal = true;
+        handle_message(
+            &mut app,
+            Message::AuthSuccess("ghp_mock_token_abc".to_string()),
+            &tx,
+            &mut sys,
+            size,
+        );
+        assert_eq!(app.auth_token.as_deref(), Some("ghp_mock_token_abc"));
+        assert_eq!(app.pat_input, "ghp_mock_token_abc");
+        assert!(!app.show_settings_modal);
     }
 }

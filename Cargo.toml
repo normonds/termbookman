@@ -26,3 +26,8 @@ unicode-width = "0.1"
 
 [patch.crates-io]
 vt100 = { path = "patch/vt100" }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

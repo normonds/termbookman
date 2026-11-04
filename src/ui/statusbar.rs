@@ -9,7 +9,11 @@ use ratatui::Frame;
 
 /// Visible items of one status bar and the area each occupies. Shared by rendering and
 /// click handling so both always agree.
-pub fn bar_layout(app: &App, bar_items: &[StatusBarItem], area: Rect) -> Vec<(StatusBarItem, Rect)> {
+pub fn bar_layout(
+    app: &App,
+    bar_items: &[StatusBarItem],
+    area: Rect,
+) -> Vec<(StatusBarItem, Rect)> {
     let visible: Vec<&StatusBarItem> = bar_items
         .iter()
         .filter(|item| app.is_item_visible(item))
@@ -76,14 +80,7 @@ pub fn render_statusbars(f: &mut Frame, app: &mut App, chunks: &[Rect]) {
                         };
 
                         let bg_color = parse_color(bg_color_str);
-                        let fg_color = if bg_color_str == "green"
-                            || bg_color_str == "cyan"
-                            || bg_color_str.starts_with("light_")
-                        {
-                            Color::Black
-                        } else {
-                            Color::White
-                        };
+                        let fg_color = crate::utils::contrasting_text_color(bg_color);
 
                         let span = Span::styled(
                             label,
@@ -104,12 +101,14 @@ pub fn render_statusbars(f: &mut Frame, app: &mut App, chunks: &[Rect]) {
                     } else {
                         Color::Yellow
                     };
-                    let cpu_mem_str = format!(
-                        "{:.0}% {}/{}GB",
-                        app.cpu_usage.round(),
-                        (app.mem_usage.0 as f64 / 1_073_741_824.0).round() as u64,
-                        (app.mem_usage.1 as f64 / 1_073_741_824.0).round() as u64
-                    );
+                    let used_gb = app.mem_usage.0 as f64 / 1_073_741_824.0;
+                    let total_gb = app.mem_usage.1 as f64 / 1_073_741_824.0;
+                    let mem_str = if total_gb < 10.0 {
+                        format!("{:.1}/{:.1}GB", used_gb, total_gb)
+                    } else {
+                        format!("{}/{}GB", used_gb.round() as u64, total_gb.round() as u64)
+                    };
+                    let cpu_mem_str = format!("{:.0}% {}", app.cpu_usage.round(), mem_str);
                     f.render_widget(
                         Paragraph::new(Span::styled(cpu_mem_str, Style::default().fg(cpu_color)))
                             .alignment(ratatui::layout::Alignment::Right)
@@ -129,7 +128,7 @@ pub fn render_statusbars(f: &mut Frame, app: &mut App, chunks: &[Rect]) {
                     );
                 }
                 ItemType::TimeAndScroll => {
-                    let parser = app.parser.lock().unwrap();
+                    let parser = app.lock_parser();
                     let screen = parser.screen();
                     let (rows, _) = screen.size();
                     let scroll_offset = screen.scrollback();
@@ -184,6 +183,20 @@ pub fn render_statusbars(f: &mut Frame, app: &mut App, chunks: &[Rect]) {
                             Paragraph::new(Span::styled(
                                 format!(" {}", msg),
                                 Style::default().fg(color).add_modifier(Modifier::BOLD),
+                            ))
+                            .style(Style::default().bg(bar_bg)),
+                            chunk,
+                        );
+                    } else if !app.unsynced_files.is_empty() {
+                        f.render_widget(
+                            Paragraph::new(Span::styled(
+                                format!(
+                                    " ↑ {} unsynced (click to upload)",
+                                    app.unsynced_files.len()
+                                ),
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD),
                             ))
                             .style(Style::default().bg(bar_bg)),
                             chunk,

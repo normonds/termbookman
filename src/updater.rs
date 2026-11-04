@@ -51,8 +51,8 @@ pub fn check_elf(bytes: &[u8], arch: &str) -> Result<(), String> {
 
 /// Downloads and installs the update. `progress` receives human-readable status lines.
 pub fn run_update(update_url: &str, progress: impl Fn(String)) -> Result<(), String> {
-    let exe_path = std::env::current_exe()
-        .map_err(|e| format!("Could not get current exe path ({})", e))?;
+    let exe_path =
+        std::env::current_exe().map_err(|e| format!("Could not get current exe path ({})", e))?;
     let url = resolve_update_url(update_url, std::env::consts::ARCH == "aarch64");
 
     let client = reqwest::blocking::Client::builder()
@@ -77,6 +77,14 @@ pub fn run_update(update_url: &str, progress: impl Fn(String)) -> Result<(), Str
     }
     let expected = parse_sha256_file(&res.text().map_err(|e| e.to_string())?)
         .ok_or("checksum file is malformed")?;
+
+    if let Ok(current_bytes) = std::fs::read(&exe_path) {
+        let current_hash = sha256_hex(&current_bytes);
+        if current_hash.eq_ignore_ascii_case(&expected) {
+            progress("✓ Already up to date.".to_string());
+            return Ok(());
+        }
+    }
 
     progress("[Update: Downloading binary...]".to_string());
     let res = client
@@ -108,10 +116,26 @@ fn install(exe_path: &Path, bytes: &[u8]) -> Result<(), String> {
     let temp_path = exe_path.with_extension("tmp_update");
     std::fs::write(&temp_path, bytes)
         .map_err(|e| format!("Could not write temporary file ({})", e))?;
+    let orig_meta = std::fs::metadata(exe_path).ok();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o755));
+        let mode = orig_meta
+            .as_ref()
+            .map(|m| m.permissions().mode())
+            .unwrap_or(0o755);
+        let _ = std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(mode));
+        if let Some(meta) = &orig_meta {
+            use std::os::unix::fs::MetadataExt;
+            let uid = meta.uid();
+            let gid = meta.gid();
+            unsafe {
+                use std::os::unix::ffi::OsStrExt;
+                if let Ok(c_path) = std::ffi::CString::new(temp_path.as_os_str().as_bytes()) {
+                    libc::chown(c_path.as_ptr(), uid, gid);
+                }
+            }
+        }
     }
 
     let runs = std::process::Command::new(&temp_path)

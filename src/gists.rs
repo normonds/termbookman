@@ -21,6 +21,8 @@ pub struct ManifestEntry {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     #[serde(default)]
+    pub gists_updated_at: BTreeMap<String, String>,
+    #[serde(default)]
     pub files: BTreeMap<String, ManifestEntry>,
 }
 
@@ -55,7 +57,13 @@ pub fn decide(local: Option<&[u8]>, synced_hash: Option<&str>, remote: &[u8]) ->
 pub fn sanitize_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
-        .map(|c| if c == '/' || c == '\\' || c == '\0' { '_' } else { c })
+        .map(|c| {
+            if c == '/' || c == '\\' || c == '\0' {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     let cleaned = cleaned.trim_start_matches('.').to_string();
     if cleaned.is_empty() {
@@ -190,6 +198,74 @@ pub fn store_remote_file(
     Ok((path, action))
 }
 
+pub fn cleanup_deleted_remote_gists(
+    gist_dir: &Path,
+    manifest: &mut Manifest,
+    active_remote_ids: &std::collections::HashSet<String>,
+) {
+    if let Ok(entries) = std::fs::read_dir(gist_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(dir_name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            if dir_name.starts_with('.') || dir_name == "commands.txt" {
+                continue;
+            }
+            if !active_remote_ids.contains(&dir_name) {
+                // This gist was removed remotely on GitHub!
+                if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                    let mut can_delete_dir = true;
+                    for sub in sub_entries.flatten() {
+                        let sub_path = sub.path();
+                        if !sub_path.is_file() {
+                            can_delete_dir = false;
+                            continue;
+                        }
+                        if let Ok(bytes) = std::fs::read(&sub_path) {
+                            let hash = content_hash(&bytes);
+                            if let Some(m_entry) = manifest.get(gist_dir, &sub_path) {
+                                if m_entry.hash == hash {
+                                    // No unuploaded local edits: safe to delete
+                                    let _ = std::fs::remove_file(&sub_path);
+                                    manifest.remove(gist_dir, &sub_path);
+                                } else {
+                                    // Local edits kept!
+                                    can_delete_dir = false;
+                                }
+                            } else {
+                                can_delete_dir = false;
+                            }
+                        }
+                    }
+                    if can_delete_dir {
+                        let _ = std::fs::remove_dir(&path);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Returns the list of cached gist files whose current disk content differs from the manifest hash.
+pub fn unsynced_cached_files(gist_dir: &Path, manifest: &Manifest) -> Vec<PathBuf> {
+    let mut unsynced = Vec::new();
+    for path in crate::entry::cached_gist_files(gist_dir) {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let current_hash = content_hash(&bytes);
+        let synced_hash = manifest.get(gist_dir, &path).map(|e| e.hash.as_str());
+        if synced_hash != Some(&current_hash) {
+            unsynced.push(path);
+        }
+    }
+    unsynced
+}
+
 /// Downloads every gist file into the cache and returns the Gists-tab entries plus the names
 /// of files whose unuploaded local edits were kept.
 pub fn fetch_all(
@@ -200,24 +276,136 @@ pub fn fetch_all(
     let gists = crate::github::list_gists(token).map_err(|e| e.to_string())?;
     log_debug(&format!("Listed {} gists", gists.len()));
 
-    // Download first, outside the manifest lock.
-    let mut downloaded = Vec::new();
+    let current_manifest = Manifest::load(gist_dir);
+    let mut active_ids = std::collections::HashSet::new();
+    let mut files_to_download = Vec::new();
+    let mut unchanged_files = Vec::new();
+
     for gist in &gists {
         let (Some(id), Some(files)) = (gist["id"].as_str(), gist["files"].as_object()) else {
             continue;
         };
+        active_ids.insert(id.to_string());
+        let updated_at = gist["updated_at"].as_str().unwrap_or_default();
+        let is_unchanged = current_manifest
+            .gists_updated_at
+            .get(id)
+            .map(|s| s.as_str())
+            == Some(updated_at);
+
         for (filename, info) in files {
-            let Some(url) = info["raw_url"].as_str() else {
-                continue;
-            };
-            match crate::github::download_text(url) {
-                Ok(content) => downloaded.push((id.to_string(), filename.clone(), content)),
-                Err(e) => log_debug(&format!("Could not download {}: {}", filename, e)),
+            let cp = cache_path(gist_dir, id, filename);
+            if is_unchanged && cp.exists() {
+                if let Ok(content) = std::fs::read_to_string(&cp) {
+                    unchanged_files.push((id.to_string(), filename.clone(), content));
+                    continue;
+                }
+            }
+            if let Some(url) = info["raw_url"].as_str() {
+                files_to_download.push((id.to_string(), filename.clone(), url.to_string()));
+            }
+        }
+    }
+
+    // Download in parallel reusing a single Client
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut downloaded = unchanged_files;
+    let results: Vec<(String, String, Option<String>)> = std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for (id, filename, url) in &files_to_download {
+            let client = &client;
+            handles.push(s.spawn(move || {
+                let res = client
+                    .get(url)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
+                    .send()
+                    .and_then(|r| r.text());
+                (id.clone(), filename.clone(), res.ok())
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+
+    for (id, filename, content_opt) in results {
+        match content_opt {
+            Some(content) => downloaded.push((id, filename, content)),
+            None => {
+                log_debug(&format!(
+                    "Failed to download {}, falling back to cached file",
+                    filename
+                ));
+                let cp = cache_path(gist_dir, &id, &filename);
+                if let Ok(cached) = std::fs::read_to_string(&cp) {
+                    downloaded.push((id, filename, cached));
+                }
             }
         }
     }
 
     let stored: Vec<(PathBuf, String, SyncAction)> = with_manifest(gist_dir, |m| {
+        // Record gist updated_at timestamps
+        for gist in &gists {
+            if let (Some(id), Some(updated_at)) = (gist["id"].as_str(), gist["updated_at"].as_str())
+            {
+                m.gists_updated_at
+                    .insert(id.to_string(), updated_at.to_string());
+            }
+        }
+
+        // Clean up remotely deleted gists that have no unuploaded local edits
+        cleanup_deleted_remote_gists(gist_dir, m, &active_ids);
+
+        // Sync remote commands.txt into local config if present
+        for (id, name, content) in &downloaded {
+            if name == "commands.txt" {
+                if let Some(cmd_path) = crate::config::commands_txt_path() {
+                    if cmd_path.exists() {
+                        let local = std::fs::read(&cmd_path).ok();
+                        let synced = m.get(gist_dir, &cmd_path).map(|e| e.hash.clone());
+                        let action =
+                            decide(local.as_deref(), synced.as_deref(), content.as_bytes());
+                        match action {
+                            SyncAction::Write => {
+                                if let Ok(()) =
+                                    crate::utils::write_file(&cmd_path, content.as_bytes())
+                                {
+                                    m.record_synced(
+                                        gist_dir,
+                                        &cmd_path,
+                                        content.as_bytes(),
+                                        Some(id.clone()),
+                                    );
+                                    log_debug("Merged remote changes into local commands.txt");
+                                }
+                            }
+                            SyncAction::Unchanged => {
+                                m.record_synced(
+                                    gist_dir,
+                                    &cmd_path,
+                                    content.as_bytes(),
+                                    Some(id.clone()),
+                                );
+                            }
+                            SyncAction::KeepLocal => {
+                                let entry =
+                                    m.files.entry(rel_key(gist_dir, &cmd_path)).or_default();
+                                entry.gist_id = Some(id.clone());
+                                log_debug("Kept local edits in commands.txt");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         downloaded
             .iter()
             .filter_map(|(id, name, content)| {
@@ -232,7 +420,7 @@ pub fn fetch_all(
             .collect()
     });
 
-    let mut counts = std::collections::HashMap::new();
+    let mut counts = std::collections::HashSet::new();
     let mut entries = Vec::new();
     let mut kept = Vec::new();
     for (path, name, action) in stored {
@@ -258,12 +446,42 @@ mod tests {
     use crate::utils::test_dir;
 
     #[test]
+    fn cleanup_deleted_remote_gists_removes_unmodified_and_keeps_edited() {
+        let dir = test_dir("cleanup_test");
+        let mut m = Manifest::default();
+
+        // Gist g1 has an unedited file
+        let (p1, _) = store_remote_file(&dir, &mut m, "g1", "clean.sh", b"v1").unwrap();
+        // Gist g2 has a locally modified file
+        let (p2, _) = store_remote_file(&dir, &mut m, "g2", "edited.sh", b"v1").unwrap();
+        std::fs::write(&p2, b"v1-modified").unwrap();
+
+        // Active remote IDs has neither g1 nor g2 (both deleted on GitHub)
+        let active = std::collections::HashSet::new();
+        cleanup_deleted_remote_gists(&dir, &mut m, &active);
+
+        // p1 should be deleted because it matches manifest hash
+        assert!(!p1.exists(), "Clean file in deleted gist should be removed");
+        // p2 should be kept because it has unuploaded local edits!
+        assert!(
+            p2.exists(),
+            "Locally edited file must be kept even if gist deleted remotely"
+        );
+    }
+
+    #[test]
     fn decide_covers_all_cases() {
         let synced = content_hash(b"v1");
         assert_eq!(decide(None, None, b"v2"), SyncAction::Write);
-        assert_eq!(decide(Some(b"v2"), Some(&synced), b"v2"), SyncAction::Unchanged);
+        assert_eq!(
+            decide(Some(b"v2"), Some(&synced), b"v2"),
+            SyncAction::Unchanged
+        );
         assert_eq!(decide(Some(b"v1"), Some(&synced), b"v2"), SyncAction::Write);
-        assert_eq!(decide(Some(b"edited"), Some(&synced), b"v2"), SyncAction::KeepLocal);
+        assert_eq!(
+            decide(Some(b"edited"), Some(&synced), b"v2"),
+            SyncAction::KeepLocal
+        );
         assert_eq!(decide(Some(b"unknown"), None, b"v2"), SyncAction::KeepLocal);
     }
 
@@ -338,7 +556,46 @@ mod tests {
         let loaded = Manifest::load(&dir);
         assert_eq!(loaded, m);
         assert_eq!(loaded.gist_id(&dir, &local).as_deref(), Some("abc"));
-        assert_eq!(loaded.gist_id(&dir, &dir.join("zzz").join("f")).as_deref(), Some("zzz"));
+        assert_eq!(
+            loaded.gist_id(&dir, &dir.join("zzz").join("f")).as_deref(),
+            Some("zzz")
+        );
         assert_eq!(loaded.gist_id(&dir, &dir.join("untracked.sh")), None);
+    }
+
+    #[test]
+    fn unsynced_cached_files_detects_modified_and_untracked_files() {
+        let dir = test_dir("unsynced");
+        let mut m = Manifest::default();
+
+        let (clean_p, _) = store_remote_file(&dir, &mut m, "g1", "clean.sh", b"v1").unwrap();
+        m.record_synced(&dir, &clean_p, b"v1", Some("g1".into()));
+
+        let (edited_p, _) = store_remote_file(&dir, &mut m, "g1", "edited.sh", b"v1").unwrap();
+        m.record_synced(&dir, &edited_p, b"v1", Some("g1".into()));
+        std::fs::write(&edited_p, b"v1-modified").unwrap();
+
+        let untracked_p = dir.join("g1").join("untracked.sh");
+        std::fs::write(&untracked_p, b"brand new").unwrap();
+
+        let unsynced = unsynced_cached_files(&dir, &m);
+        assert!(
+            !unsynced.contains(&clean_p),
+            "Clean file should not be reported unsynced"
+        );
+        assert!(
+            unsynced.contains(&edited_p),
+            "Modified file should be reported unsynced"
+        );
+        assert!(
+            unsynced.contains(&untracked_p),
+            "Untracked file should be reported unsynced"
+        );
+
+        // Record edited_p as synced
+        m.record_synced(&dir, &edited_p, b"v1-modified", Some("g1".into()));
+        let unsynced_after = unsynced_cached_files(&dir, &m);
+        assert!(!unsynced_after.contains(&edited_p));
+        assert!(unsynced_after.contains(&untracked_p));
     }
 }

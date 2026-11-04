@@ -1,5 +1,5 @@
 use crate::utils::{dedup_label, parse_lines, parse_script_content};
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -55,22 +55,93 @@ impl Entry {
     }
 
     pub fn matches(&self, query: &str) -> bool {
-        if query.is_empty() {
-            return true;
-        }
-        let q = query.to_lowercase();
-        self.label.to_lowercase().contains(&q) || self.info.to_lowercase().contains(&q)
+        self.score(query).is_some()
+    }
+
+    pub fn score(&self, query: &str) -> Option<i64> {
+        let label_score = fuzzy_score(&self.label, query);
+        let info_score = fuzzy_score(&self.info, query);
+        let cmd_score = fuzzy_score(&self.command, query);
+
+        label_score
+            .into_iter()
+            .chain(info_score)
+            .chain(cmd_score)
+            .max()
     }
 }
 
-/// Indices of the entries matching `query`, in order.
+/// Fuzzy matching score with word-boundary, consecutive character, and prefix bonuses.
+pub fn fuzzy_score(text: &str, query: &str) -> Option<i64> {
+    let text_lower = text.to_lowercase();
+    let query_lower = query.to_lowercase();
+
+    if query_lower.is_empty() {
+        return Some(0);
+    }
+
+    if text_lower == query_lower {
+        return Some(10_000);
+    }
+
+    if text_lower.starts_with(&query_lower) {
+        return Some(5_000 - text.len() as i64);
+    }
+
+    if let Some(pos) = text_lower.find(&query_lower) {
+        return Some(2_000 - pos as i64 * 10 - text.len() as i64);
+    }
+
+    // Subsequence matching
+    let mut score = 0i64;
+    let mut prev_idx: Option<usize> = None;
+    let mut text_chars = text_lower.char_indices();
+
+    for qc in query_lower.chars() {
+        let mut matched = false;
+        for (idx, tc) in text_chars.by_ref() {
+            if tc == qc {
+                matched = true;
+                if let Some(prev) = prev_idx {
+                    if idx == prev + 1 {
+                        score += 50;
+                    } else {
+                        score -= (idx - prev) as i64;
+                    }
+                }
+                if idx == 0
+                    || text_lower
+                        .as_bytes()
+                        .get(idx - 1)
+                        .is_some_and(|b| b.is_ascii_whitespace() || *b == b'-' || *b == b'_')
+                {
+                    score += 100;
+                }
+                prev_idx = Some(idx);
+                score += 10;
+                break;
+            }
+        }
+        if !matched {
+            return None;
+        }
+    }
+    Some(score)
+}
+
+/// Indices of the entries matching `query`, sorted by fuzzy match score.
 pub fn filter_indices(entries: &[Entry], query: &str) -> Vec<usize> {
-    entries
+    let q = query.trim();
+    if q.is_empty() {
+        return (0..entries.len()).collect();
+    }
+    let mut matches: Vec<(usize, i64)> = entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| e.matches(query))
-        .map(|(i, _)| i)
-        .collect()
+        .filter_map(|(i, e)| e.score(q).map(|score| (i, score)))
+        .collect();
+    matches.sort_by(|a, b| b.1.cmp(&a.1));
+    matches.into_iter().map(|(i, _)| i).collect()
 }
 
 fn script_name_from_filename(filename: &str) -> String {
@@ -92,7 +163,7 @@ pub fn parse_file_entries(
     content: &str,
     remote_name: Option<&str>,
     mtime: Option<SystemTime>,
-    label_counts: &mut HashMap<String, usize>,
+    label_counts: &mut HashSet<String>,
 ) -> Vec<Entry> {
     let filename = path
         .file_name()
@@ -101,7 +172,7 @@ pub fn parse_file_entries(
     let remote_name = remote_name.map(|s| s.to_string());
 
     if content.contains("# termbookman") || remote_name.is_none() && filename == "commands.txt" {
-        let (keys, cmds, infos) = parse_lines(content, "cmd", &mut HashMap::new());
+        let (keys, cmds, infos) = parse_lines(content, "cmd", &mut HashSet::new());
         return keys
             .into_iter()
             .zip(cmds)
@@ -184,9 +255,37 @@ pub fn cached_gist_files(gist_dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Loads only the cached gists into entries.
+pub fn load_cached_gist_entries(gist_dir: &Path) -> Vec<Entry> {
+    let mut label_counts = HashSet::new();
+    let mut entries = Vec::new();
+    for path in cached_gist_files(gist_dir) {
+        let filename = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if filename == "commands.txt" {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        entries.extend(parse_file_entries(
+            &path,
+            &content,
+            Some(&filename),
+            mtime,
+            &mut label_counts,
+        ));
+    }
+    entries
+}
+
 /// Loads commands.txt (created from `default_commands` if missing) followed by the cached gists.
 pub fn load_entries(cmd_path: &Path, gist_dir: &Path, default_commands: &str) -> Vec<Entry> {
-    let mut label_counts = HashMap::new();
+    let mut label_counts = HashSet::new();
     if !cmd_path.exists() {
         let _ = crate::utils::write_file(cmd_path, default_commands);
     }
@@ -195,7 +294,11 @@ pub fn load_entries(cmd_path: &Path, gist_dir: &Path, default_commands: &str) ->
     let mut entries = parse_file_entries(cmd_path, &content, None, None, &mut label_counts);
 
     for path in cached_gist_files(gist_dir) {
-        let filename = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let filename = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         // A synced copy of commands.txt would only duplicate the entries above.
         if filename == "commands.txt" {
             continue;
@@ -223,7 +326,7 @@ pub fn find_in_file(path: &Path, key: &str) -> Option<Entry> {
     let remote = (filename != "commands.txt").then_some(filename.as_str());
     // Only cached gists carry a cache time.
     let mtime = remote.and(mtime);
-    parse_file_entries(path, &content, remote, mtime, &mut HashMap::new())
+    parse_file_entries(path, &content, remote, mtime, &mut HashSet::new())
         .into_iter()
         .find(|e| e.key == key)
 }
@@ -235,7 +338,7 @@ mod tests {
 
     #[test]
     fn commands_file_entries_have_stable_keys_and_unique_labels() {
-        let mut counts = HashMap::new();
+        let mut counts = HashSet::new();
         let a = parse_file_entries(
             Path::new("/x/commands.txt"),
             "# up start\ndocker compose up\n",
@@ -258,7 +361,7 @@ mod tests {
 
     #[test]
     fn script_and_raw_gists_are_detected() {
-        let mut counts = HashMap::new();
+        let mut counts = HashSet::new();
         let s = parse_file_entries(
             Path::new("/g/abc/script-backup.sh"),
             "#!/bin/bash\n# backup Copy files\nrsync -a a b\n",
@@ -299,15 +402,30 @@ mod tests {
         std::fs::create_dir_all(gists.join("bbb")).unwrap();
         std::fs::create_dir_all(gists.join("aaa")).unwrap();
         std::fs::write(gists.join(MANIFEST_FILE), "{}").unwrap();
-        std::fs::write(gists.join("aaa").join("commands.txt"), "# termbookman\nls\n").unwrap();
-        std::fs::write(gists.join("bbb").join("x.sh"), "#!/bin/sh\n# ls second\nls\n").unwrap();
-        std::fs::write(gists.join("aaa").join("y.sh"), "#!/bin/sh\n# ls first\nls\n").unwrap();
+        std::fs::write(
+            gists.join("aaa").join("commands.txt"),
+            "# termbookman\nls\n",
+        )
+        .unwrap();
+        std::fs::write(
+            gists.join("bbb").join("x.sh"),
+            "#!/bin/sh\n# ls second\nls\n",
+        )
+        .unwrap();
+        std::fs::write(
+            gists.join("aaa").join("y.sh"),
+            "#!/bin/sh\n# ls first\nls\n",
+        )
+        .unwrap();
 
         let entries = load_entries(&cmd, &gists, "# ls default\nls -la\n");
         assert!(cmd.exists(), "commands.txt must be created from defaults");
         let labels: Vec<_> = entries.iter().map(|e| e.label.as_str()).collect();
         assert_eq!(labels, vec!["ls", "ls2", "ls3"]);
-        assert_eq!(entries[1].path.as_deref(), Some(gists.join("aaa").join("y.sh").as_path()));
+        assert_eq!(
+            entries[1].path.as_deref(),
+            Some(gists.join("aaa").join("y.sh").as_path())
+        );
         assert_eq!(entries, load_entries(&cmd, &gists, ""));
     }
 
@@ -318,7 +436,10 @@ mod tests {
         std::fs::write(&f, "# a first\necho 1\n# a second\necho 2\n").unwrap();
         let found = find_in_file(&f, "a2").unwrap();
         assert_eq!(found.command, "echo 2");
-        assert_eq!(found.mtime, None, "commands.txt entries are not cached gists");
+        assert_eq!(
+            found.mtime, None,
+            "commands.txt entries are not cached gists"
+        );
         let g = dir.join("tool.sh");
         std::fs::write(&g, "#!/bin/sh\necho\n").unwrap();
         assert!(find_in_file(&g, "tool.sh").unwrap().mtime.is_some());
@@ -327,7 +448,7 @@ mod tests {
 
     #[test]
     fn filter_matches_label_or_info_case_insensitively() {
-        let mut counts = HashMap::new();
+        let mut counts = HashSet::new();
         let entries = parse_file_entries(
             Path::new("/c/commands.txt"),
             "# Deploy push site\nmake deploy\n# test run tests\nmake test\n",
@@ -338,5 +459,25 @@ mod tests {
         assert_eq!(filter_indices(&entries, "PUSH"), vec![0]);
         assert_eq!(filter_indices(&entries, "test"), vec![1]);
         assert_eq!(filter_indices(&entries, ""), vec![0, 1]);
+    }
+
+    #[test]
+    fn fuzzy_matching_ranks_prefix_and_matches_subsequences() {
+        let mut counts = HashSet::new();
+        let entries = parse_file_entries(
+            Path::new("/c/commands.txt"),
+            "# ping-server\nping 1.1.1.1\n# start-proxy\nproxy\n# ping-local\nping 127.0.0.1\n",
+            None,
+            None,
+            &mut counts,
+        );
+        // "ping" prefix matches ping-server and ping-local first
+        let res = filter_indices(&entries, "ping");
+        assert_eq!(res.len(), 2);
+        assert!(res.contains(&0) && res.contains(&2));
+
+        // Subsequence "sp" matches "start-proxy" via s...p
+        let res_sp = filter_indices(&entries, "sp");
+        assert_eq!(res_sp[0], 1);
     }
 }

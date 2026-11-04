@@ -39,7 +39,13 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user-static
+
+      - name: Lint and Format Check
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
 
       - name: Build
         run: |
@@ -56,8 +62,12 @@ jobs:
           (cd bin && sha256sum ${{ matrix.release_name }} > ${{ matrix.release_name }}.sha256)
 
       - name: Test
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo test --release
+        run: |
+          if [ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64 -L /usr/aarch64-linux-gnu"
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          fi
+          cargo test --release --target ${{ matrix.target }}
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
@@ -88,8 +98,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.date.outputs.date }}
-          name: v${{ steps.date.outputs.date }}
+          tag_name: v${{ steps.date.outputs.date }}.${{ github.run_number }}
+          name: v${{ steps.date.outputs.date }}.${{ github.run_number }}
           files: |
             bin/tbm
             bin/tbm.sha256

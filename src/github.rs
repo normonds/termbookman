@@ -18,7 +18,44 @@ fn authed(
     token: &str,
 ) -> reqwest::blocking::RequestBuilder {
     req.header("Authorization", format!("token {}", token))
-        .header("Accept", "application/vnd.github.v3+json")
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+}
+
+pub fn http_error_message(status: reqwest::StatusCode, body: &str) -> String {
+    if (status == reqwest::StatusCode::FORBIDDEN
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS)
+        && (body.contains("rate limit") || body.contains("API rate limit exceeded"))
+    {
+        return format!("GitHub API rate limit exceeded ({})", status);
+    }
+    if let Ok(val) = serde_json::from_str::<Value>(body) {
+        if let Some(msg) = val.get("message").and_then(|m| m.as_str()) {
+            return format!("{}: {}", status, msg);
+        }
+    }
+    format!("{}", status)
+}
+
+pub fn get_hostname() -> String {
+    #[cfg(unix)]
+    {
+        let mut buf = vec![0u8; 256];
+        let res = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if res == 0 {
+            if let Some(pos) = buf.iter().position(|&b| b == 0) {
+                buf.truncate(pos);
+            }
+            if let Ok(s) = String::from_utf8(buf) {
+                if !s.is_empty() {
+                    return s;
+                }
+            }
+        }
+    }
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("HOST"))
+        .unwrap_or_else(|_| "remote".to_string())
 }
 
 /// Lists all of the user's gists, following pagination.
@@ -56,6 +93,7 @@ pub fn download_text(url: &str) -> Result<String, Box<dyn Error>> {
 }
 
 /// Id of the first gist containing a file named `filename`.
+#[allow(dead_code)]
 pub fn find_gist_id(gists: &[Value], filename: &str) -> Option<String> {
     gists
         .iter()
@@ -107,38 +145,78 @@ pub fn deletion_plan(gist: &Value, filename: &str) -> DeletePlan {
     }
 }
 
-fn resolve_gist_id(
-    token: &str,
-    gist_id: Option<&str>,
-    filename: &str,
-) -> Result<Option<String>, Box<dyn Error>> {
-    if let Some(id) = gist_id {
-        return Ok(Some(id.to_string()));
-    }
-    Ok(find_gist_id(&list_gists(token)?, filename))
+pub fn resolve_gist_id(gist_id: Option<&str>) -> Option<String> {
+    gist_id.map(|id| id.to_string())
 }
 
-/// Uploads `content` as `remote_filename`, updating the given gist (or the gist that has a file
-/// with that name) or creating a new private gist. Returns the gist id.
+/// Uploads `content` as `remote_filename`, updating the given gist (with conflict detection)
+/// or creating a new private gist if the gist id is unknown. Returns the gist id.
 pub fn upload_gist(
     token: &str,
     content: &str,
     remote_filename: &str,
     gist_id: Option<&str>,
+    expected_hash: Option<&str>,
 ) -> Result<String, Box<dyn Error>> {
     let client = client()?;
 
-    if let Some(id) = resolve_gist_id(token, gist_id, remote_filename)? {
+    if let Some(id) = resolve_gist_id(gist_id) {
+        let mut target_filename = remote_filename.to_string();
+
+        // Conflict check: if gist exists, check whether remote content differs from expected_hash
+        let check_res = authed(client.get(format!("{}/gists/{}", API, id)), token).send()?;
+        if check_res.status().is_success() {
+            let gist_val: Value = check_res.json()?;
+            if let Some(file_obj) = gist_val["files"].get(remote_filename) {
+                let remote_content = if file_obj["truncated"].as_bool() == Some(true) {
+                    if let Some(raw_url) = file_obj["raw_url"].as_str() {
+                        download_text(raw_url).ok()
+                    } else {
+                        None
+                    }
+                } else {
+                    file_obj["content"].as_str().map(|s| s.to_string())
+                };
+
+                if let Some(rc) = remote_content {
+                    let remote_hash = crate::gists::content_hash(rc.as_bytes());
+                    if let Some(exp) = expected_hash {
+                        if exp != remote_hash && rc != content {
+                            target_filename =
+                                format!("{}.conflict-{}", remote_filename, get_hostname());
+                            crate::utils::log_debug(&format!(
+                                "Upload conflict for {}: remote hash {} != manifest hash {}. Saving as {}",
+                                remote_filename, remote_hash, exp, target_filename
+                            ));
+                        }
+                    }
+                }
+            }
+        } else if check_res.status() != reqwest::StatusCode::NOT_FOUND {
+            let status = check_res.status();
+            let body = check_res.text().unwrap_or_default();
+            return Err(format!(
+                "Failed to query gist: {}",
+                http_error_message(status, &body)
+            )
+            .into());
+        }
+
         let res = authed(client.patch(format!("{}/gists/{}", API, id)), token)
-            .json(&files_body(remote_filename, Some(content)))
+            .json(&files_body(&target_filename, Some(content)))
             .send()?;
         let status = res.status();
         if status.is_success() {
             return Ok(id);
         }
         // A known id that no longer exists means the gist was deleted on GitHub: recreate it.
-        if !(status == reqwest::StatusCode::NOT_FOUND && gist_id.is_some()) {
-            return Err(format!("Failed to update gist: {}", status).into());
+        if status != reqwest::StatusCode::NOT_FOUND {
+            let body = res.text().unwrap_or_default();
+            return Err(format!(
+                "Failed to update gist: {}",
+                http_error_message(status, &body)
+            )
+            .into());
         }
     }
 
@@ -147,8 +225,12 @@ pub fn upload_gist(
         .send()?;
     let status = res.status();
     if !status.is_success() {
-        let error_body = res.text().unwrap_or_else(|_| "Unknown error".to_string());
-        return Err(format!("Failed to create gist: {} - {}", status, error_body).into());
+        let body = res.text().unwrap_or_default();
+        return Err(format!(
+            "Failed to create gist: {}",
+            http_error_message(status, &body)
+        )
+        .into());
     }
     let created: Value = res.json()?;
     created["id"]
@@ -164,13 +246,15 @@ pub fn delete_gist_file(
     gist_id: Option<&str>,
     remote_filename: &str,
 ) -> Result<DeletePlan, Box<dyn Error>> {
-    let Some(id) = resolve_gist_id(token, gist_id, remote_filename)? else {
-        return Err("Gist not found on GitHub".into());
+    let Some(id) = resolve_gist_id(gist_id) else {
+        return Err("Cannot delete: gist id is unknown".into());
     };
     let client = client()?;
     let res = authed(client.get(format!("{}/gists/{}", API, id)), token).send()?;
-    if !res.status().is_success() {
-        return Err(format!("Failed to read gist: {}", res.status()).into());
+    let status = res.status();
+    if !status.is_success() {
+        let body = res.text().unwrap_or_default();
+        return Err(format!("Failed to read gist: {}", http_error_message(status, &body)).into());
     }
     let gist: Value = res.json()?;
     let plan = deletion_plan(&gist, remote_filename);
@@ -183,11 +267,16 @@ pub fn delete_gist_file(
             .json(&files_body(remote_filename, None))
             .send()?,
     };
-    if res.status().is_success() {
-        Ok(plan)
-    } else {
-        Err(format!("Failed to delete: {}", res.status()).into())
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().unwrap_or_default();
+        return Err(format!(
+            "Failed to delete gist file: {}",
+            http_error_message(status, &body)
+        )
+        .into());
     }
+    Ok(plan)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -302,6 +391,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gist_id_resolution_with_unknown_id_never_patches_existing_gist() {
+        assert_eq!(resolve_gist_id(None), None);
+        assert_eq!(resolve_gist_id(Some("12345")), Some("12345".to_string()));
+    }
+
+    #[test]
+    fn http_error_message_extracts_only_message_and_sanitizes() {
+        let err = http_error_message(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"message": "Validation Failed", "errors": ["secret stuff"]}"#,
+        );
+        assert_eq!(err, "400 Bad Request: Validation Failed");
+        assert!(!err.contains("secret stuff"));
+
+        let rate_limit = http_error_message(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"message": "API rate limit exceeded for user"}"#,
+        );
+        assert!(rate_limit.contains("rate limit exceeded"));
+    }
+
+    #[test]
     fn find_gist_id_matches_filename() {
         let gists = vec![
             json!({"id": "a", "files": {"x.sh": {}}}),
@@ -322,10 +433,7 @@ mod tests {
 
     #[test]
     fn bodies_have_the_shape_github_expects() {
-        assert_eq!(
-            files_body("a.sh", None),
-            json!({"files": {"a.sh": null}})
-        );
+        assert_eq!(files_body("a.sh", None), json!({"files": {"a.sh": null}}));
         let body = create_body("a.sh", "echo");
         assert_eq!(body["files"]["a.sh"]["content"], "echo");
         assert_eq!(body["public"], false);
@@ -350,7 +458,10 @@ mod tests {
             PollResult::Failed(_)
         ));
         // Previously this case looped forever.
-        assert!(matches!(interpret_token_response(&json!({})), PollResult::Failed(_)));
+        assert!(matches!(
+            interpret_token_response(&json!({})),
+            PollResult::Failed(_)
+        ));
     }
 
     #[test]

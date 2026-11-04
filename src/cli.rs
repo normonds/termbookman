@@ -12,7 +12,12 @@ pub fn run(args: &[String], load: impl Fn() -> Vec<Entry>) -> Option<i32> {
     let action = args.get(1)?;
     let code = match (action.as_str(), args.get(2), args.get(3)) {
         ("-v" | "--version", _, _) => {
-            println!("build date/time: {}", env!("BUILD_DATE_TIME"));
+            println!(
+                "termbookman {} ({}) {}",
+                env!("CARGO_PKG_VERSION"),
+                env!("GIT_SHA"),
+                env!("BUILD_DATE_TIME")
+            );
             0
         }
         ("print", Some(kind), Some(label)) if kind == "script" => {
@@ -107,7 +112,12 @@ pub fn command_line(entry: &Entry, ask: impl FnMut(&str, &str) -> String) -> Vec
 fn execute(entry: &Entry) -> i32 {
     let gist_info = entry
         .mtime
-        .map(|m| format!(" [gist from local cache, saved {} ago]", format_time_passed(m)))
+        .map(|m| {
+            format!(
+                " [gist from local cache, saved {} ago]",
+                format_time_passed(m)
+            )
+        })
         .unwrap_or_default();
     let argv = command_line(entry, ask_stdin);
     let shown = match entry.kind {
@@ -116,7 +126,10 @@ fn execute(entry: &Entry) -> i32 {
         _ => format!("Executing{}: {}", gist_info, argv[2]),
     };
     println!("\x1b[90m{}\x1b[0m", shown);
-    match std::process::Command::new(&argv[0]).args(&argv[1..]).status() {
+    match std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .status()
+    {
         Ok(status) => status.code().unwrap_or(1),
         Err(e) => {
             eprintln!("termbookman: failed to run {}: {}", argv[0], e);
@@ -149,9 +162,15 @@ mod tests {
             entry("deploy", EntryKind::Command, "make deploy"),
             entry("deploy2", EntryKind::Script, "/g/deploy.sh"),
         ];
-        assert_eq!(find_label(&entries, "deploy", false).unwrap().command, "make deploy");
+        assert_eq!(
+            find_label(&entries, "deploy", false).unwrap().command,
+            "make deploy"
+        );
         assert!(find_label(&entries, "deploy", true).is_none());
-        assert_eq!(find_label(&entries, "deploy2", true).unwrap().command, "/g/deploy.sh");
+        assert_eq!(
+            find_label(&entries, "deploy2", true).unwrap().command,
+            "/g/deploy.sh"
+        );
     }
 
     #[test]

@@ -65,8 +65,12 @@ pub fn fix_owner(path: &Path) {
         if unsafe { libc::geteuid() } != 0 {
             return;
         }
-        let uid = std::env::var("SUDO_UID").ok().and_then(|v| v.parse::<u32>().ok());
-        let gid = std::env::var("SUDO_GID").ok().and_then(|v| v.parse::<u32>().ok());
+        let uid = std::env::var("SUDO_UID")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok());
+        let gid = std::env::var("SUDO_GID")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok());
         if let (Some(uid), Some(gid)) = (uid, gid) {
             let _ = std::os::unix::fs::chown(path, Some(uid), Some(gid));
         }
@@ -106,12 +110,29 @@ pub fn create_dir_all_owned(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Writes a file, creating parent directories, and keeps ownership correct under sudo.
+fn temp_path_for(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let filename = format!(
+        ".{}.tmp.{}.{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        count
+    );
+    path.with_file_name(filename)
+}
+
+/// Writes a file atomically using a temporary file and rename, creating parent directories
+/// and keeping ownership correct under sudo.
 pub fn write_file(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         create_dir_all_owned(dir)?;
     }
-    std::fs::write(path, content)?;
+    let tmp = temp_path_for(path);
+    std::fs::write(&tmp, content)?;
+    fix_owner(&tmp);
+    std::fs::rename(&tmp, path)?;
     fix_owner(path);
     Ok(())
 }
@@ -121,6 +142,7 @@ pub fn write_private_file(path: &Path, content: impl AsRef<[u8]>) -> std::io::Re
     if let Some(dir) = path.parent() {
         create_dir_all_owned(dir)?;
     }
+    let tmp = temp_path_for(path);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -129,12 +151,15 @@ pub fn write_private_file(path: &Path, content: impl AsRef<[u8]>) -> std::io::Re
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(path)?;
+            .open(&tmp)?;
         f.write_all(content.as_ref())?;
     }
     #[cfg(not(unix))]
-    std::fs::write(path, content)?;
+    std::fs::write(&tmp, content)?;
     // `mode` only applies on creation; tighten files that already existed.
+    set_private_permissions(&tmp);
+    fix_owner(&tmp);
+    std::fs::rename(&tmp, path)?;
     set_private_permissions(path);
     fix_owner(path);
     Ok(())
@@ -177,6 +202,24 @@ pub fn truncate_to_width(s: &str, max_width: usize) -> String {
 
 pub fn display_width(s: &str) -> usize {
     s.chars().map(|c| c.width().unwrap_or(0)).sum()
+}
+
+/// Extracts all `<prompt:Label:Default>` tags from `cmd` as `(label, default)` pairs.
+pub fn extract_prompts(cmd: &str) -> Vec<(String, String)> {
+    let mut prompts = Vec::new();
+    let mut rest = cmd;
+    while let Some(start) = rest.find("<prompt:") {
+        let Some(end) = rest[start..].find('>') else {
+            break;
+        };
+        let tag = &rest[start + "<prompt:".len()..start + end];
+        let mut parts = tag.splitn(2, ':');
+        let label = parts.next().filter(|l| !l.is_empty()).unwrap_or("Value");
+        let default = parts.next().unwrap_or("");
+        prompts.push((label.to_string(), default.to_string()));
+        rest = &rest[start + end + 1..];
+    }
+    prompts
 }
 
 /// Replaces every `<prompt:Label:Default>` tag in `cmd` with the value returned by `ask`.
@@ -285,7 +328,7 @@ pub fn parse_script_content(content: &str) -> (Option<String>, String, String) {
 pub fn parse_lines(
     content: &str,
     default_label: &str,
-    label_counts: &mut std::collections::HashMap<String, usize>,
+    used_labels: &mut std::collections::HashSet<String>,
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut labels = Vec::new();
     let mut commands = Vec::new();
@@ -295,7 +338,7 @@ pub fn parse_lines(
 
     for line in content.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.contains("# termbookman") {
+        if trimmed.is_empty() || (trimmed.starts_with('#') && trimmed.contains("termbookman")) {
             continue;
         }
 
@@ -314,7 +357,7 @@ pub fn parse_lines(
                     .to_string()
             });
 
-            labels.push(dedup_label(&base_name, &base_name, label_counts));
+            labels.push(dedup_label(&base_name, &base_name, used_labels));
             commands.push(trimmed.to_string());
             infos.push(std::mem::take(&mut last_info));
         }
@@ -322,18 +365,24 @@ pub fn parse_lines(
     (labels, commands, infos)
 }
 
-/// Returns `base` the first time `key` is seen and `base2`, `base3`, ... afterwards.
+/// Returns `base` if unused, or `base2`, `base3`, ... incrementing until the label is unused.
 pub fn dedup_label(
-    key: &str,
+    _key: &str,
     base: &str,
-    label_counts: &mut std::collections::HashMap<String, usize>,
+    used_labels: &mut std::collections::HashSet<String>,
 ) -> String {
-    let count = label_counts.entry(key.to_string()).or_insert(0);
-    *count += 1;
-    if *count > 1 {
-        format!("{}{}", base, *count)
-    } else {
-        base.to_string()
+    if !used_labels.contains(base) {
+        used_labels.insert(base.to_string());
+        return base.to_string();
+    }
+    let mut count = 2;
+    loop {
+        let candidate = format!("{}{}", base, count);
+        if !used_labels.contains(&candidate) {
+            used_labels.insert(candidate.clone());
+            return candidate;
+        }
+        count += 1;
     }
 }
 
@@ -376,6 +425,83 @@ pub fn parse_color(color: &str) -> Color {
     }
 }
 
+/// Returns black or white text depending on the luminance of `bg`.
+pub fn contrasting_text_color(bg: ratatui::style::Color) -> ratatui::style::Color {
+    use ratatui::style::Color;
+    let (r, g, b) = match bg {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Indexed(i) => match i {
+            0 => (0, 0, 0),
+            1 => (128, 0, 0),
+            2 => (0, 128, 0),
+            3 => (128, 128, 0),
+            4 => (0, 0, 128),
+            5 => (128, 0, 128),
+            6 => (0, 128, 128),
+            7 => (192, 192, 192),
+            8 => (128, 128, 128),
+            9 => (255, 0, 0),
+            10 => (0, 255, 0),
+            11 => (255, 255, 0),
+            12 => (0, 0, 255),
+            13 => (255, 0, 255),
+            14 => (0, 255, 255),
+            15 => (255, 255, 255),
+            _ => (128, 128, 128),
+        },
+        Color::Black => (0, 0, 0),
+        Color::Red => (205, 0, 0),
+        Color::Green => (0, 205, 0),
+        Color::Yellow => (205, 205, 0),
+        Color::Blue => (0, 0, 238),
+        Color::Magenta => (205, 0, 205),
+        Color::Cyan => (0, 205, 205),
+        Color::Gray => (192, 192, 192),
+        Color::DarkGray => (128, 128, 128),
+        Color::LightRed => (255, 99, 71),
+        Color::LightGreen => (144, 238, 144),
+        Color::LightYellow => (255, 255, 224),
+        Color::LightBlue => (173, 216, 230),
+        Color::LightMagenta => (255, 182, 193),
+        Color::LightCyan => (224, 255, 255),
+        Color::White => (255, 255, 255),
+        Color::Reset => (0, 0, 0),
+    };
+    let luminance = 0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64;
+    if luminance > 130.0 {
+        Color::Black
+    } else {
+        Color::White
+    }
+}
+
+/// Simple standard base64 encoding without external dependencies.
+pub fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 /// Creates a fresh, empty temporary directory for tests.
 #[cfg(test)]
 pub fn test_dir(name: &str) -> PathBuf {
@@ -395,7 +521,6 @@ pub fn test_dir(name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn truncate_never_splits_multibyte_chars() {
@@ -428,12 +553,19 @@ mod tests {
         let mut asked = Vec::new();
         let out = substitute_prompts("ssh <prompt:Host:localhost> -p <prompt:Port>", |l, d| {
             asked.push((l.to_string(), d.to_string()));
-            if l == "Host" { "example.com".into() } else { d.into() }
+            if l == "Host" {
+                "example.com".into()
+            } else {
+                d.into()
+            }
         });
         assert_eq!(out, "ssh example.com -p ");
         assert_eq!(
             asked,
-            vec![("Host".into(), "localhost".into()), ("Port".into(), "".into())]
+            vec![
+                ("Host".into(), "localhost".into()),
+                ("Port".into(), "".into())
+            ]
         );
     }
 
@@ -445,17 +577,42 @@ mod tests {
 
     #[test]
     fn substitute_prompts_keeps_unterminated_tag() {
-        assert_eq!(substitute_prompts("echo <prompt:X", |_, _| "v".into()), "echo <prompt:X");
+        assert_eq!(
+            substitute_prompts("echo <prompt:X", |_, _| "v".into()),
+            "echo <prompt:X"
+        );
     }
 
     #[test]
     fn parse_lines_uses_comment_labels_and_dedups() {
-        let mut counts = HashMap::new();
+        let mut counts = std::collections::HashSet::new();
         let content = "# termbookman\n# ll list files\nls -la\nls\n\n# ll again\nls -l\n";
         let (labels, cmds, infos) = parse_lines(content, "cmd", &mut counts);
         assert_eq!(labels, vec!["ll", "ls", "ll2"]);
         assert_eq!(cmds, vec!["ls -la", "ls", "ls -l"]);
         assert_eq!(infos, vec!["list files", "", "again"]);
+    }
+
+    #[test]
+    fn parse_lines_keeps_commands_containing_termbookman() {
+        let mut counts = std::collections::HashSet::new();
+        let content = "# termbookman\necho \"# termbookman\"\n";
+        let (labels, cmds, _) = parse_lines(content, "cmd", &mut counts);
+        assert_eq!(labels, vec!["echo"]);
+        assert_eq!(cmds, vec!["echo \"# termbookman\""]);
+    }
+
+    #[test]
+    fn dedup_label_collision_case() {
+        let mut used = std::collections::HashSet::new();
+        assert_eq!(dedup_label("ls", "ls", &mut used), "ls");
+        assert_eq!(dedup_label("ls", "ls", &mut used), "ls2");
+        assert_eq!(dedup_label("ls2", "ls2", &mut used), "ls22");
+
+        let mut used2 = std::collections::HashSet::new();
+        assert_eq!(dedup_label("ls", "ls", &mut used2), "ls");
+        assert_eq!(dedup_label("ls2", "ls2", &mut used2), "ls2");
+        assert_eq!(dedup_label("ls", "ls", &mut used2), "ls3");
     }
 
     #[test]
@@ -486,7 +643,8 @@ mod tests {
 
     #[test]
     fn format_time_passed_formats_units() {
-        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 + 3600 * 2 + 60 * 5);
+        let t = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(86400 + 3600 * 2 + 60 * 5);
         assert_eq!(format_time_passed(t), "1d2h5m");
         assert_eq!(format_time_passed(std::time::SystemTime::now()), "0m");
     }
@@ -519,5 +677,30 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn contrasting_text_color_picks_black_for_light_and_white_for_dark() {
+        use ratatui::style::Color;
+        assert_eq!(contrasting_text_color(Color::White), Color::Black);
+        assert_eq!(contrasting_text_color(Color::Black), Color::White);
+        assert_eq!(
+            contrasting_text_color(Color::Rgb(255, 255, 0)),
+            Color::Black
+        );
+        assert_eq!(contrasting_text_color(Color::Rgb(10, 10, 20)), Color::White);
+        assert_eq!(
+            contrasting_text_color(Color::Rgb(240, 240, 240)),
+            Color::Black
+        );
+    }
+
+    #[test]
+    fn base64_encode_matches_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"hello world"), "aGVsbG8gd29ybGQ=");
     }
 }

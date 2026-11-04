@@ -69,6 +69,11 @@ each message in `handle_message`/`handle_event`, then redraws once.
   `selected_entry()`; don't index `entries()` with the selection directly.
 - **Status bar layout is shared.** Rendering and click handling both use
   `ui::statusbar::bar_layout`; change sizing there only.
+- **Modal and sidebar layouts are shared.** Rendering and click handling both use
+  shared layout helpers (`sidebar_layout` -> `SidebarRects`, `settings_layout` -> `SettingsRects`,
+  `delete_confirm_layout` -> `DeleteConfirmRects`, `new_gist_layout` -> `NewGistRects`,
+  `prompt_layout` -> `PromptRects`), just as `statusbar::bar_layout` does. Never duplicate
+  layout constraints between rendering and mouse handlers.
 - **Gist sync must not lose data.** Fetches go through `gists::store_remote_file`, which keeps
   unuploaded local edits (manifest hash differs). Record successful uploads with
   `Manifest::record_synced`. Only call GitHub delete when the gist id is known, and use

@@ -33,7 +33,7 @@ pub fn commands_txt_path() -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
-fn home_dir_of(user: &str) -> Option<PathBuf> {
+pub fn home_dir_of(user: &str) -> Option<PathBuf> {
     let name = std::ffi::CString::new(user).ok()?;
     // SAFETY: getpwnam returns a pointer to static storage or null; we copy out immediately.
     unsafe {
@@ -47,11 +47,11 @@ fn home_dir_of(user: &str) -> Option<PathBuf> {
 }
 
 #[cfg(not(unix))]
-fn home_dir_of(_user: &str) -> Option<PathBuf> {
+pub fn home_dir_of(_user: &str) -> Option<PathBuf> {
     None
 }
 
-#[derive(Deserialize, Serialize, Clone, Default)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct Config {
     #[serde(default)]
     pub statusbar: StatusBarConfig,
@@ -61,6 +61,52 @@ pub struct Config {
     pub external_editor: String,
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub shell: Option<String>,
+    #[serde(default = "default_scrollback")]
+    pub scrollback: usize,
+    #[serde(default = "default_menu_items")]
+    pub menu: Vec<MenuItem>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+pub struct MenuItem {
+    pub key: char,
+    pub label: String,
+    pub command: String,
+}
+
+pub fn default_menu_items() -> Vec<MenuItem> {
+    vec![
+        MenuItem {
+            key: 'b',
+            label: "Run Btop".to_string(),
+            command: "btop".to_string(),
+        },
+        MenuItem {
+            key: 's',
+            label: "Check Space".to_string(),
+            command: "df -h".to_string(),
+        },
+    ]
+}
+
+fn default_scrollback() -> usize {
+    1000
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            statusbar: StatusBarConfig::default(),
+            auth: AuthConfig::default(),
+            external_editor: default_editor(),
+            ui: UiConfig::default(),
+            shell: None,
+            scrollback: 1000,
+            menu: default_menu_items(),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Default)]
@@ -167,13 +213,84 @@ pub enum ConditionType {
     HasSelection,
 }
 
+pub fn update_config_in_place(existing: &str, config: &Config) -> Option<String> {
+    let mut lines: Vec<String> = existing.lines().map(|s| s.to_string()).collect();
+
+    let update_key = |lines: &mut Vec<String>, key: &str, new_val: Option<&str>| {
+        let prefix = format!("{} = ", key);
+        let mut found = false;
+        let mut i = 0;
+        while i < lines.len() {
+            let trimmed = lines[i].trim();
+            if trimmed.starts_with(&prefix) {
+                found = true;
+                if let Some(val) = new_val {
+                    lines[i] = format!(
+                        "{} = \"{}\"",
+                        key,
+                        val.replace('\\', "\\\\").replace('"', "\\\"")
+                    );
+                    i += 1;
+                } else {
+                    lines.remove(i);
+                }
+            } else {
+                i += 1;
+            }
+        }
+        if !found {
+            if let Some(val) = new_val {
+                lines.push(format!(
+                    "{} = \"{}\"",
+                    key,
+                    val.replace('\\', "\\\\").replace('"', "\\\"")
+                ));
+            }
+        }
+    };
+
+    update_key(&mut lines, "external_editor", Some(&config.external_editor));
+    update_key(&mut lines, "update_url", Some(&config.auth.update_url));
+    update_key(
+        &mut lines,
+        "personal_access_token",
+        config.auth.personal_access_token.as_deref(),
+    );
+
+    let result = lines.join("\n") + "\n";
+    if toml::from_str::<Config>(&result).is_ok() {
+        Some(result)
+    } else {
+        None
+    }
+}
+
 pub fn save_config(config: &Config) -> Result<(), Box<dyn Error>> {
     if let Some(config_dir) = get_config_dir() {
-        let config_file = config_dir.join("config.toml");
-        let content = toml::to_string_pretty(config)?;
-        // config.toml holds the GitHub token, so keep it private.
-        crate::utils::write_private_file(&config_file, content)?;
+        save_config_in_dir(&config_dir, config)?;
     }
+    Ok(())
+}
+
+pub fn save_config_in_dir(
+    config_dir: &std::path::Path,
+    config: &Config,
+) -> Result<(), Box<dyn Error>> {
+    let config_file = config_dir.join("config.toml");
+    if config_file.exists() {
+        let bak = config_dir.join("config.toml.bak");
+        let _ = std::fs::copy(&config_file, &bak);
+    }
+    let content = if config_file.exists() {
+        std::fs::read_to_string(&config_file)
+            .ok()
+            .and_then(|orig| update_config_in_place(&orig, config))
+            .unwrap_or_else(|| toml::to_string_pretty(config).unwrap_or_default())
+    } else {
+        toml::to_string_pretty(config)?
+    };
+    // config.toml holds the GitHub token, so keep it private.
+    crate::utils::write_private_file(&config_file, content)?;
     Ok(())
 }
 
@@ -284,35 +401,54 @@ label = " EXIT "
 action = "quit"
 color = "red"
 hover_color = "light_red"
+
+[[menu]]
+key = "b"
+label = "Run Btop"
+command = "btop"
+
+[[menu]]
+key = "s"
+label = "Check Space"
+command = "df -h"
 "##;
 
-pub fn load_config() -> Config {
-    if let Some(config_dir) = get_config_dir() {
-        let config_file = config_dir.join("config.toml");
-        log_debug(&format!("Checking config at: {:?}", config_file));
+pub fn load_config() -> (Config, Option<String>) {
+    get_config_dir().map_or_else(
+        || (toml::from_str(DEFAULT_CONFIG).unwrap_or_default(), None),
+        |dir| load_config_from_dir(&dir),
+    )
+}
 
-        if config_file.exists() {
-            if let Ok(content) = std::fs::read_to_string(&config_file) {
-                match toml::from_str(&content) {
-                    Ok(config) => {
-                        log_debug("Config loaded successfully from file");
-                        return config;
-                    }
-                    Err(e) => {
-                        log_debug(&format!("Config parse error: {}", e));
-                    }
+pub fn load_config_from_dir(config_dir: &std::path::Path) -> (Config, Option<String>) {
+    let config_file = config_dir.join("config.toml");
+    log_debug(&format!("Checking config at: {:?}", config_file));
+
+    if config_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(&config_file) {
+            match toml::from_str(&content) {
+                Ok(config) => {
+                    log_debug("Config loaded successfully from file");
+                    return (config, None);
+                }
+                Err(e) => {
+                    let err = format!("Config parse error: {}", e);
+                    log_debug(&err);
+                    let bak = config_dir.join("config.toml.bak");
+                    let _ = std::fs::copy(&config_file, &bak);
+                    return (
+                        toml::from_str(DEFAULT_CONFIG).unwrap_or_default(),
+                        Some(err),
+                    );
                 }
             }
-        } else {
-            log_debug("Config file not found, writing default");
-            let _ = crate::utils::write_private_file(&config_file, DEFAULT_CONFIG);
         }
     } else {
-        log_debug("Could not determine project directories");
+        log_debug("Config file not found, writing default");
+        let _ = crate::utils::write_private_file(&config_file, DEFAULT_CONFIG);
     }
 
-    log_debug("Falling back to default config");
-    toml::from_str(DEFAULT_CONFIG).unwrap_or_default()
+    (toml::from_str(DEFAULT_CONFIG).unwrap_or_default(), None)
 }
 
 #[cfg(test)]
@@ -324,7 +460,11 @@ mod tests {
         let config: Config = toml::from_str(DEFAULT_CONFIG).expect("default config must parse");
         assert!(!config.auth.sync_commands_to_gist);
         assert_eq!(config.external_editor, "nano");
-        assert!(config.statusbar.lower.iter().any(|i| i.action == Some(ActionType::Quit)));
+        assert!(config
+            .statusbar
+            .lower
+            .iter()
+            .any(|i| i.action == Some(ActionType::Quit)));
     }
 
     #[test]
@@ -342,5 +482,35 @@ mod tests {
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.auth.personal_access_token.as_deref(), Some("abc"));
         assert_eq!(back.statusbar.upper.len(), config.statusbar.upper.len());
+    }
+
+    #[test]
+    fn bad_config_is_backed_up_and_flagged_as_error() {
+        let dir = crate::utils::test_dir("bad_config");
+        let cfg_file = dir.join("config.toml");
+        std::fs::write(&cfg_file, "this is definitely not valid toml = [").unwrap();
+
+        let (_config, err) = load_config_from_dir(&dir);
+        assert!(err.is_some(), "Parse error must be returned");
+        let bak_file = dir.join("config.toml.bak");
+        assert!(bak_file.exists(), "Broken config must be backed up to .bak");
+        assert_eq!(
+            std::fs::read_to_string(&bak_file).unwrap(),
+            "this is definitely not valid toml = ["
+        );
+    }
+
+    #[test]
+    fn update_config_in_place_preserves_comments() {
+        let original = "# Custom Header\nexternal_editor = \"nano\"\n# Keep this comment\n[auth]\nupdate_url = \"https://example.com/tbm\"\n";
+        let mut cfg: Config = toml::from_str(original).unwrap();
+        cfg.external_editor = "vim".to_string();
+        cfg.auth.personal_access_token = Some("ghp_secret".to_string());
+
+        let updated = update_config_in_place(original, &cfg).unwrap();
+        assert!(updated.contains("# Custom Header"));
+        assert!(updated.contains("# Keep this comment"));
+        assert!(updated.contains("external_editor = \"vim\""));
+        assert!(updated.contains("personal_access_token = \"ghp_secret\""));
     }
 }

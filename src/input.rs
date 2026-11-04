@@ -1,6 +1,8 @@
 //! Translation of crossterm input events into the byte sequences a program in the PTY expects.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 /// xterm modifier parameter: 1 + shift + 2*alt + 4*ctrl.
@@ -243,9 +245,15 @@ mod tests {
 
     #[test]
     fn alt_prefixes_escape() {
-        assert_eq!(key(KeyCode::Char('b'), KeyModifiers::ALT), b"\x1bb".to_vec());
         assert_eq!(
-            key(KeyCode::Char('x'), KeyModifiers::ALT | KeyModifiers::CONTROL),
+            key(KeyCode::Char('b'), KeyModifiers::ALT),
+            b"\x1bb".to_vec()
+        );
+        assert_eq!(
+            key(
+                KeyCode::Char('x'),
+                KeyModifiers::ALT | KeyModifiers::CONTROL
+            ),
             vec![0x1b, 0x18]
         );
     }
@@ -256,11 +264,17 @@ mod tests {
         assert_eq!(key(KeyCode::Backspace, n), vec![0x7f]);
         assert_eq!(key(KeyCode::Backspace, KeyModifiers::CONTROL), vec![0x08]);
         assert_eq!(key(KeyCode::Enter, n), b"\r".to_vec());
-        assert_eq!(key(KeyCode::BackTab, KeyModifiers::SHIFT), b"\x1b[Z".to_vec());
+        assert_eq!(
+            key(KeyCode::BackTab, KeyModifiers::SHIFT),
+            b"\x1b[Z".to_vec()
+        );
         assert_eq!(key(KeyCode::PageUp, n), b"\x1b[5~".to_vec());
         assert_eq!(key(KeyCode::PageDown, n), b"\x1b[6~".to_vec());
         assert_eq!(key(KeyCode::Insert, n), b"\x1b[2~".to_vec());
-        assert_eq!(key(KeyCode::Delete, KeyModifiers::CONTROL), b"\x1b[3;5~".to_vec());
+        assert_eq!(
+            key(KeyCode::Delete, KeyModifiers::CONTROL),
+            b"\x1b[3;5~".to_vec()
+        );
         assert_eq!(key(KeyCode::Char('é'), n), "é".as_bytes().to_vec());
     }
 
@@ -269,8 +283,14 @@ mod tests {
         let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(key_to_bytes(&up, false).unwrap(), b"\x1b[A".to_vec());
         assert_eq!(key_to_bytes(&up, true).unwrap(), b"\x1bOA".to_vec());
-        assert_eq!(key(KeyCode::Left, KeyModifiers::CONTROL), b"\x1b[1;5D".to_vec());
-        assert_eq!(key(KeyCode::End, KeyModifiers::SHIFT), b"\x1b[1;2F".to_vec());
+        assert_eq!(
+            key(KeyCode::Left, KeyModifiers::CONTROL),
+            b"\x1b[1;5D".to_vec()
+        );
+        assert_eq!(
+            key(KeyCode::End, KeyModifiers::SHIFT),
+            b"\x1b[1;2F".to_vec()
+        );
     }
 
     #[test]
@@ -280,7 +300,10 @@ mod tests {
         assert_eq!(key(KeyCode::F(4), n), b"\x1bOS".to_vec());
         assert_eq!(key(KeyCode::F(5), n), b"\x1b[15~".to_vec());
         assert_eq!(key(KeyCode::F(12), n), b"\x1b[24~".to_vec());
-        assert_eq!(key(KeyCode::F(2), KeyModifiers::SHIFT), b"\x1b[1;2Q".to_vec());
+        assert_eq!(
+            key(KeyCode::F(2), KeyModifiers::SHIFT),
+            b"\x1b[1;2Q".to_vec()
+        );
         assert!(key_to_bytes(&KeyEvent::new(KeyCode::F(13), n), false).is_none());
     }
 
@@ -315,7 +338,12 @@ mod tests {
         assert_eq!(d(MouseButton::Middle), b"\x1b[<1;10;5M".to_vec());
         assert_eq!(d(MouseButton::Right), b"\x1b[<2;10;5M".to_vec());
         assert_eq!(
-            mouse(MouseEventKind::Up(MouseButton::Right), M::PressRelease, E::Sgr).unwrap(),
+            mouse(
+                MouseEventKind::Up(MouseButton::Right),
+                M::PressRelease,
+                E::Sgr
+            )
+            .unwrap(),
             b"\x1b[<2;10;5m".to_vec()
         );
     }
@@ -327,9 +355,15 @@ mod tests {
         let up = MouseEventKind::Up(MouseButton::Left);
         assert!(mouse(moved, M::PressRelease, E::Sgr).is_none());
         assert!(mouse(moved, M::ButtonMotion, E::Sgr).is_none());
-        assert_eq!(mouse(moved, M::AnyMotion, E::Sgr).unwrap(), b"\x1b[<35;10;5M".to_vec());
+        assert_eq!(
+            mouse(moved, M::AnyMotion, E::Sgr).unwrap(),
+            b"\x1b[<35;10;5M".to_vec()
+        );
         assert!(mouse(drag, M::PressRelease, E::Sgr).is_none());
-        assert_eq!(mouse(drag, M::ButtonMotion, E::Sgr).unwrap(), b"\x1b[<32;10;5M".to_vec());
+        assert_eq!(
+            mouse(drag, M::ButtonMotion, E::Sgr).unwrap(),
+            b"\x1b[<32;10;5M".to_vec()
+        );
         assert!(mouse(up, M::Press, E::Sgr).is_none());
         assert!(mouse(MouseEventKind::Down(MouseButton::Left), M::None, E::Sgr).is_none());
     }
@@ -342,17 +376,29 @@ mod tests {
             vec![0x1b, b'[', b'M', 32, 42, 37]
         );
         assert_eq!(
-            mouse(MouseEventKind::Up(MouseButton::Left), M::PressRelease, E::Default).unwrap(),
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                M::PressRelease,
+                E::Default
+            )
+            .unwrap(),
             vec![0x1b, b'[', b'M', 35, 42, 37]
         );
         assert_eq!(
             mouse(MouseEventKind::ScrollUp, M::Press, E::Default).unwrap(),
             vec![0x1b, b'[', b'M', 96, 42, 37]
         );
-        assert!(
-            encode_mouse(down, KeyModifiers::NONE, 300, 5, M::PressRelease, E::Default).is_none()
-        );
-        let utf8 = encode_mouse(down, KeyModifiers::NONE, 300, 5, M::PressRelease, E::Utf8).unwrap();
+        assert!(encode_mouse(
+            down,
+            KeyModifiers::NONE,
+            300,
+            5,
+            M::PressRelease,
+            E::Default
+        )
+        .is_none());
+        let utf8 =
+            encode_mouse(down, KeyModifiers::NONE, 300, 5, M::PressRelease, E::Utf8).unwrap();
         assert_eq!(&utf8[..4], b"\x1b[M ");
         assert_eq!(std::str::from_utf8(&utf8[4..]).unwrap(), "\u{14c}%");
     }

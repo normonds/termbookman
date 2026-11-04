@@ -9,3 +9,7 @@ patch/**/target/
 
 # Ignore Cargo.lock files within patches (the main workspace lock is sufficient)
 patch/**/Cargo.lock
+
+# Tooling
+.antigravitycli/
+

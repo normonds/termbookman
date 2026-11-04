@@ -1,7 +1,9 @@
 use crate::config::{
-    commands_txt_path, gist_dir, load_config, ConditionType, Config, StatusBarItem,
+    commands_txt_path, gist_dir, home_dir_of, load_config, ConditionType, Config, StatusBarItem,
 };
-use crate::entry::{filter_indices, load_entries, parse_file_entries, Entry, EntryKind};
+use crate::entry::{
+    filter_indices, load_cached_gist_entries, load_entries, parse_file_entries, Entry, EntryKind,
+};
 use crate::utils::log_debug;
 use crossterm::event::Event;
 use ratatui::widgets::ListState;
@@ -25,22 +27,28 @@ pub enum Message {
     Event(Event),
     PtyData,
     Tick,
+    GitInfo(Option<String>),
     DeviceCodeSuccess(crate::github::DeviceCode),
     AuthSuccess(String), // access_token
     AuthError(String),
     /// The device login flow ended (successfully or not).
     DeviceFlowFinished,
     GistFetchError(String),
-    FetchGists,
+    FetchGists {
+        switch_tab: bool,
+    },
     DeleteGist(PathBuf),
     CreateNewGist,
     ConfirmNewGistName(String), // custom gist name
-    /// Fetched entries and the names of files whose local edits were kept.
-    GistsFetched(Vec<Entry>, Vec<String>),
+    GistDeletedLocally(PathBuf),
+    /// Fetched entries and the names of files whose local edits were kept, plus whether to switch tab.
+    GistsFetched(Vec<Entry>, Vec<String>, bool),
     GistUploadStatus(String, bool), // (message, is_success)
     /// An upload succeeded: (local path, uploaded content, gist id).
     GistUploaded(PathBuf, String, String),
     UpdateBinary,
+    UpdateFinished(Result<(), String>),
+    UploadUnsynced,
 }
 
 /// Default commands written to commands.txt on first run.
@@ -77,12 +85,16 @@ pub struct App {
     pub start_time: Instant,
     pub search_query: String,
     pub is_search_focused: bool,
+    pub is_sidebar_focused: bool,
+    pub cached_filtered_indices: Vec<usize>,
+    pub git_query_running: bool,
     pub sidebar_mode: SidebarMode,
     pub history_entries: Vec<Entry>,
     pub gist_entries: Vec<Entry>,
     pub shell_pid: u32,
     pub is_pty_busy: bool,
     pub config: Config,
+    pub config_error: Option<String>,
 
     // Settings / Auth State
     pub show_settings_modal: bool,
@@ -103,7 +115,11 @@ pub struct App {
     pub loading_gist: bool,
     pub last_click_time: Option<Instant>,
     pub last_clicked_index: Option<usize>,
+    pub last_term_click_time: Option<Instant>,
+    pub last_term_click_cell: Option<(u16, u16)>,
+    pub term_click_count: u8,
     pub update_disabled_reason: Option<String>,
+    pub is_updating: bool,
 
     // Editing Tracking
     pub editing_file: Option<(PathBuf, std::time::SystemTime)>,
@@ -126,6 +142,19 @@ pub struct App {
     pub github_status_msg: Option<String>,
     pub github_status_is_error: bool,
     pub github_status_until: Option<std::time::Instant>,
+    pub unsynced_files: Vec<PathBuf>,
+
+    // TUI Prompt Modal State
+    pub prompt_state: Option<PromptState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptState {
+    pub template: String,
+    pub prompts: Vec<(String, String)>,
+    pub current_idx: usize,
+    pub current_input: String,
+    pub answers: Vec<String>,
 }
 
 fn check_update_disabled() -> Option<String> {
@@ -194,6 +223,10 @@ pub fn git_info_for(dir: &Path) -> Option<String> {
 }
 
 impl App {
+    pub fn lock_parser(&self) -> std::sync::MutexGuard<'_, vt100::Parser> {
+        self.parser.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn set_github_status(&mut self, msg: impl Into<String>, is_error: bool, secs: u64) {
         self.github_status_msg = Some(msg.into());
         self.github_status_is_error = is_error;
@@ -220,8 +253,12 @@ impl App {
     }
 
     /// Indices into `entries()` that match the search query, in display order.
-    pub fn filtered_indices(&self) -> Vec<usize> {
-        filter_indices(self.entries(), &self.search_query)
+    pub fn filtered_indices(&self) -> &[usize] {
+        &self.cached_filtered_indices
+    }
+
+    pub fn recompute_filtered_indices(&mut self) {
+        self.cached_filtered_indices = filter_indices(self.entries(), &self.search_query);
     }
 
     /// The entry under the sidebar selection (the selection indexes the filtered list).
@@ -233,6 +270,31 @@ impl App {
 
     pub fn reload_sidebar(&mut self) {
         self.sidebar_entries = load_all_entries();
+        self.recompute_filtered_indices();
+    }
+
+    /// Finds an entry matching `path` across gist_entries and sidebar_entries.
+    pub fn find_entry_by_path(&self, path: &Path) -> Option<&Entry> {
+        self.gist_entries
+            .iter()
+            .chain(self.sidebar_entries.iter())
+            .find(|e| e.path.as_deref() == Some(path))
+    }
+
+    /// Opens the prompt dialog modal for an ad-hoc command containing `<prompt:...>` tags.
+    pub fn open_prompt_dialog(&mut self, cmd: &str) {
+        let prompts = crate::utils::extract_prompts(cmd);
+        if prompts.is_empty() {
+            return;
+        }
+        let first_default = prompts[0].1.clone();
+        self.prompt_state = Some(PromptState {
+            template: cmd.to_string(),
+            prompts,
+            current_idx: 0,
+            current_input: first_default,
+            answers: Vec::new(),
+        });
     }
 
     pub fn new(
@@ -244,7 +306,7 @@ impl App {
     ) -> App {
         let mut state = ListState::default();
         state.select(Some(0));
-        let config = load_config();
+        let (config, config_error) = load_config();
         let auth_token = config
             .auth
             .personal_access_token
@@ -254,7 +316,7 @@ impl App {
         let commands_txt_mtime = commands_txt_path
             .as_ref()
             .and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-        App {
+        let mut app = App {
             cpu_usage: 0.0,
             mem_usage: (0, 0),
             git_info: None,
@@ -278,12 +340,16 @@ impl App {
             selection_end: None,
             search_query: String::new(),
             is_search_focused: false,
+            is_sidebar_focused: false,
             sidebar_mode: SidebarMode::Commands,
             history_entries: Vec::new(),
-            gist_entries: Vec::new(),
+            gist_entries: load_cached_gist_entries(&gist_dir()),
+            cached_filtered_indices: Vec::new(),
+            git_query_running: false,
             shell_pid,
             is_pty_busy: false,
             config: config.clone(),
+            config_error,
             show_settings_modal: false,
             github_user_code: None,
             github_verification_uri: None,
@@ -303,6 +369,9 @@ impl App {
             loading_gist: false,
             last_click_time: None,
             last_clicked_index: None,
+            last_term_click_time: None,
+            last_term_click_cell: None,
+            term_click_count: 0,
             editing_file: None,
             last_pty_busy: false,
             show_new_gist_dialog: false,
@@ -310,18 +379,35 @@ impl App {
             show_delete_confirm: false,
             gist_to_delete: None,
             update_disabled_reason: check_update_disabled(),
+            is_updating: false,
+            prompt_state: None,
             commands_txt_path,
             commands_txt_mtime,
             commands_txt_changed: false,
             github_status_msg: None,
             github_status_is_error: false,
             github_status_until: None,
-        }
+            unsynced_files: Vec::new(),
+        };
+        app.recompute_filtered_indices();
+        app
     }
 
     pub fn refresh_history(&mut self) {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let history_path = Path::new(&home).join(".bash_history");
+        let history_path =
+            if let Some(histfile) = std::env::var_os("HISTFILE").filter(|h| !h.is_empty()) {
+                PathBuf::from(histfile)
+            } else if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+                if let Some(home) = home_dir_of(&sudo_user) {
+                    home.join(".bash_history")
+                } else {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    Path::new(&home).join(".bash_history")
+                }
+            } else {
+                let home = std::env::var("HOME").unwrap_or_default();
+                Path::new(&home).join(".bash_history")
+            };
         let content = std::fs::read(history_path)
             .map(|b| String::from_utf8_lossy(&b).into_owned())
             .unwrap_or_default();
@@ -329,6 +415,7 @@ impl App {
             .iter()
             .map(|c| Entry::history(c))
             .collect();
+        self.recompute_filtered_indices();
     }
 
     /// Re-parses an edited gist file and updates its rows in the Gists tab.
@@ -345,20 +432,34 @@ impl App {
         };
         let old = self.gist_entries[pos].clone();
         let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-        let filename = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let filename = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         let remote = old.remote_name.clone().unwrap_or(filename);
-        // Count labels of all other rows so the new labels stay unique.
-        let mut counts = std::collections::HashMap::new();
-        for e in self.gist_entries.iter().filter(|e| e.path.as_deref() != Some(path)) {
-            counts.insert(e.label.clone(), 1);
+        // Track labels of all other rows so the new labels stay unique.
+        let mut counts = std::collections::HashSet::new();
+        for e in self
+            .gist_entries
+            .iter()
+            .filter(|e| e.path.as_deref() != Some(path))
+        {
+            counts.insert(e.label.clone());
         }
         let fresh = parse_file_entries(path, &content, Some(&remote), mtime, &mut counts);
-        self.gist_entries.retain(|e| e.path.as_deref() != Some(path));
+        self.gist_entries
+            .retain(|e| e.path.as_deref() != Some(path));
         let at = pos.min(self.gist_entries.len());
         self.gist_entries.splice(at..at, fresh);
+        self.recompute_filtered_indices();
     }
 
-    pub fn update_stats(&mut self, sys: &mut System) -> Option<PathBuf> {
+    pub fn update_stats(
+        &mut self,
+        sys: &mut System,
+        tx: &std::sync::mpsc::Sender<Message>,
+    ) -> Option<PathBuf> {
         // Clear expired github status notifications
         if let Some(until) = self.github_status_until {
             if std::time::Instant::now() >= until {
@@ -369,17 +470,18 @@ impl App {
 
         sys.refresh_cpu();
         sys.refresh_memory();
-        sys.refresh_processes();
 
-        self.cpu_usage = sys.global_cpu_info().cpu_usage();
-        self.mem_usage = (sys.used_memory(), sys.total_memory());
-
-        // The shell is busy while it has child processes.
-        let shell_pid = sysinfo::Pid::from_u32(self.shell_pid);
-        self.is_pty_busy = sys
-            .processes()
-            .values()
-            .any(|p| p.parent() == Some(shell_pid));
+        // The shell is busy while the foreground process group is not the shell.
+        if let Some(leader) = self.master.process_group_leader() {
+            self.is_pty_busy = leader > 0 && leader as u32 != self.shell_pid;
+        } else {
+            sys.refresh_processes();
+            let shell_pid = sysinfo::Pid::from_u32(self.shell_pid);
+            self.is_pty_busy = sys
+                .processes()
+                .values()
+                .any(|p| p.parent() == Some(shell_pid));
+        }
 
         let mut gist_to_upload = None;
 
@@ -413,17 +515,24 @@ impl App {
             }
         }
 
-        // Ticks are 1s apart; refresh git info every 4 ticks.
-        self.git_counter += 1;
-        if self.git_counter < 4 && self.git_info.is_some() {
-            return gist_to_upload;
-        }
-        self.git_counter = 0;
+        let gdir = gist_dir();
+        let manifest = crate::gists::Manifest::load(&gdir);
+        self.unsynced_files = crate::gists::unsynced_cached_files(&gdir, &manifest);
 
-        let dir = process_cwd(self.shell_pid)
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
-        self.git_info = git_info_for(&dir);
+        // Ticks are 1s apart; refresh git info in background every 4 ticks.
+        self.git_counter += 1;
+        if (self.git_counter >= 4 || self.git_info.is_none()) && !self.git_query_running {
+            self.git_counter = 0;
+            self.git_query_running = true;
+            let dir = process_cwd(self.shell_pid)
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| PathBuf::from("."));
+            let tx_clone = tx.clone();
+            std::thread::spawn(move || {
+                let info = git_info_for(&dir);
+                let _ = tx_clone.send(Message::GitInfo(info));
+            });
+        }
 
         gist_to_upload
     }
@@ -435,17 +544,32 @@ impl App {
             return;
         };
         let text = {
-            let parser = self.parser.lock().unwrap();
+            let parser = self.lock_parser();
             selection_text(parser.screen(), start, end)
         };
         log_debug(&format!("Copying {} chars", text.chars().count()));
-        match arboard::Clipboard::new() {
-            Ok(mut clipboard) => {
-                if let Err(e) = clipboard.set_text(text) {
-                    log_debug(&format!("Clipboard set_text error: {:?}", e));
-                }
+        let mut arboard_succeeded = false;
+        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+            if clipboard.set_text(text.clone()).is_ok() {
+                arboard_succeeded = true;
             }
-            Err(e) => log_debug(&format!("Clipboard init error: {:?}", e)),
+        }
+        if arboard_succeeded {
+            self.set_github_status("✓ Copied to clipboard", false, 3);
+        } else {
+            let encoded = crate::utils::base64_encode(text.as_bytes());
+            let osc52 = format!("\x1b]52;c;{}\x07", encoded);
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            if out
+                .write_all(osc52.as_bytes())
+                .and_then(|_| out.flush())
+                .is_ok()
+            {
+                self.set_github_status("✓ Copied via OSC 52", false, 3);
+            } else {
+                self.set_github_status("✗ Clipboard copy failed", true, 5);
+            }
         }
     }
 }
@@ -528,7 +652,10 @@ mod tests {
     #[test]
     fn history_is_newest_first_deduped_and_limited() {
         let content = "ls\ncd /tmp\n#1700000000\nls\n  \ngit status\ncd /tmp\n";
-        assert_eq!(dedup_history(content, 10), vec!["cd /tmp", "git status", "ls"]);
+        assert_eq!(
+            dedup_history(content, 10),
+            vec!["cd /tmp", "git status", "ls"]
+        );
         assert_eq!(dedup_history(content, 2), vec!["cd /tmp", "git status"]);
     }
 
@@ -582,7 +709,17 @@ mod tests {
         // An unborn branch has no HEAD commit, so rev-parse fails; that's "no info".
         assert_eq!(git_info_for(&dir), None);
         let commit = Command::new("git")
-            .args(["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"])
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ])
             .current_dir(&dir)
             .status()
             .unwrap();
@@ -597,8 +734,70 @@ mod tests {
         if cfg!(target_os = "linux") {
             assert_eq!(
                 process_cwd(std::process::id()).map(|p| p.canonicalize().unwrap()),
-                std::env::current_dir().ok().map(|p| p.canonicalize().unwrap())
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.canonicalize().unwrap())
             );
         }
+    }
+
+    #[test]
+    fn open_prompt_dialog_lifecycle_and_multi_prompt_workflow() {
+        let pty_system = portable_pty::native_pty_system();
+        let pair = pty_system
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+
+        let mut app = App::new(
+            Box::new(std::io::sink()),
+            pair.master,
+            Arc::new(Mutex::new(Parser::new(24, 80, 0))),
+            Vec::new(),
+            std::process::id(),
+        );
+
+        // Command with no prompts does nothing.
+        app.open_prompt_dialog("echo hello");
+        assert!(app.prompt_state.is_none());
+
+        // Command with multiple prompts
+        let cmd = "curl -u <prompt:User:admin>:<prompt:Pass:secret> <prompt:URL:http://localhost>";
+        app.open_prompt_dialog(cmd);
+        assert!(app.prompt_state.is_some());
+
+        let state = app.prompt_state.as_mut().unwrap();
+        assert_eq!(state.prompts.len(), 3);
+        assert_eq!(state.current_idx, 0);
+        assert_eq!(state.prompts[0], ("User".to_string(), "admin".to_string()));
+        assert_eq!(state.current_input, "admin");
+
+        // Submit first prompt
+        state.answers.push("alice".to_string());
+        state.current_idx += 1;
+        state.current_input = state.prompts[state.current_idx].1.clone();
+        assert_eq!(state.current_input, "secret");
+
+        // Submit second prompt
+        state.answers.push("hunter2".to_string());
+        state.current_idx += 1;
+        state.current_input = state.prompts[state.current_idx].1.clone();
+        assert_eq!(state.current_input, "http://localhost");
+
+        // Submit third prompt
+        state.answers.push("http://example.com/api".to_string());
+        state.current_idx += 1;
+        assert_eq!(state.current_idx, state.prompts.len());
+
+        // Perform final prompt substitution
+        let mut answers_iter = state.answers.clone().into_iter();
+        let final_cmd = crate::utils::substitute_prompts(&state.template, |_label, _default| {
+            answers_iter.next().unwrap_or_default()
+        });
+        assert_eq!(final_cmd, "curl -u alice:hunter2 http://example.com/api");
     }
 }
