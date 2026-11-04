@@ -140,7 +140,7 @@ pub fn filter_indices(entries: &[Entry], query: &str) -> Vec<usize> {
         .enumerate()
         .filter_map(|(i, e)| e.score(q).map(|score| (i, score)))
         .collect();
-    matches.sort_by(|a, b| b.1.cmp(&a.1));
+    matches.sort_by_key(|a| std::cmp::Reverse(a.1));
     matches.into_iter().map(|(i, _)| i).collect()
 }
 
