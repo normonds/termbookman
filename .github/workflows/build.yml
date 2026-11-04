@@ -99,8 +99,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.date.outputs.date }}.${{ github.run_number }}
-          name: v${{ steps.date.outputs.date }}.${{ github.run_number }}
+          tag_name: v${{ steps.date.outputs.date }}
+          name: v${{ steps.date.outputs.date }}
           files: |
             bin/tbm
             bin/tbm.sha256
